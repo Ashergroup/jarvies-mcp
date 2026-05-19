@@ -1,0 +1,1 @@
+"""MCP platform package."""
