@@ -6,24 +6,35 @@ cache, which is one POST per refresh — the SDK's surface area is more weight
 than benefit. Switching to `xero-python` later only changes the token + HTTP
 call paths.
 
+Lifecycle:
+- One process-wide `XeroService` singleton, created lazily via `_get_service()`.
+  All tool calls share the same `httpx.AsyncClient` and access-token cache,
+  so successive Xero tools in a single run reuse the cached access token
+  (typically one /connect/token call per ~30 minutes of activity, not per
+  tool call). Tests reset the singleton via `_reset_service()`.
+
 Auth paths (chosen at call time):
-- Path A — authorization_code + refresh_token (preferred). When
-  `XERO_REFRESH_TOKEN` is set, the service refreshes against
-  `https://identity.xero.com/connect/token` with
-  `grant_type=refresh_token`. If Xero rotates the refresh token in the
-  response, we log a WARNING with the new value — the user updates `.env`
-  manually (no automatic disk writes).
-- Path B — client_credentials (Custom Connection, machine-to-machine).
-  Used as a fallback when no refresh token is set but client_id/secret/
-  tenant_id are all present. Some Xero regions don't allow Custom
-  Connections, in which case Path A is the only option.
+- Path A — authorization_code + refresh_token (preferred). When a refresh
+  token is available, the service refreshes against
+  `https://identity.xero.com/connect/token` with `grant_type=refresh_token`.
+  Xero rotates the refresh token on every refresh; the new value is
+  persisted to `.secrets/xero_refresh_token.txt` (atomic write, mode 0600
+  on POSIX). On startup, that file takes precedence over `XERO_REFRESH_TOKEN`
+  from env, so `.env` only ever holds the *initial bootstrap* value from the
+  OAuth dance.
+- Path B — client_credentials (Custom Connection, machine-to-machine). Used
+  when no refresh token is set but client_id/secret/tenant_id are all
+  present. Some Xero regions don't allow Custom Connections; Path A is the
+  primary path going forward.
 """
 
 from __future__ import annotations
 
 import base64
 import logging
+import os
 import time
+from pathlib import Path
 from typing import Any
 
 import httpx
@@ -37,6 +48,50 @@ from agents.mcp.tenant_context import build_tenant_context, use_tenant_context
 log = logging.getLogger(__name__)
 
 _TOKEN_REFRESH_SKEW_SECONDS = 60.0
+
+# Repo-root-relative location for the rotated refresh token. The repo root is
+# three levels up from this file: agents/mcp/tools/xero_tools.py → ../../../
+_REPO_ROOT = Path(__file__).resolve().parents[3]
+_DEFAULT_REFRESH_TOKEN_PATH = _REPO_ROOT / ".secrets" / "xero_refresh_token.txt"
+
+
+def _refresh_token_path() -> Path:
+    """Resolve the on-disk path for the persisted refresh token.
+
+    Honours `XERO_REFRESH_TOKEN_FILE` if set, otherwise the project default.
+    Tests use the env var to redirect into `tmp_path`.
+    """
+
+    override = os.environ.get("XERO_REFRESH_TOKEN_FILE")
+    return Path(override) if override else _DEFAULT_REFRESH_TOKEN_PATH
+
+
+def _read_persisted_refresh_token() -> str:
+    """Return the persisted refresh token, or '' if the file is absent/empty."""
+
+    path = _refresh_token_path()
+    try:
+        text = path.read_text(encoding="utf-8").strip()
+    except FileNotFoundError:
+        return ""
+    except OSError:
+        return ""
+    return text
+
+
+def _write_persisted_refresh_token(value: str) -> None:
+    """Atomically persist a new refresh token to disk. Never logs the value."""
+
+    path = _refresh_token_path()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_suffix(path.suffix + ".tmp")
+    tmp.write_text(value, encoding="utf-8")
+    if os.name != "nt":
+        try:
+            os.chmod(tmp, 0o600)
+        except OSError:
+            pass
+    os.replace(tmp, path)
 
 
 class _CachedToken:
@@ -53,17 +108,22 @@ class _CachedToken:
 
 
 class XeroService:
-    """Read-only Xero Accounting API client using a Custom Connection.
+    """Read-only Xero Accounting API client.
 
-    One `httpx.AsyncClient` per service instance, created lazily. Tokens are
-    cached per `tenant_id` in process memory and refreshed on expiry. Nothing
-    is written to disk.
+    Designed to live as a process-wide singleton (see `_get_service()`).
+    Owns one shared `httpx.AsyncClient`, an access-token cache keyed by
+    tenant id, and the current refresh token (which may rotate during the
+    lifetime of the service).
     """
 
     def __init__(self, settings: MCPSettings | None = None) -> None:
         self._settings = settings or get_settings()
         self._client: httpx.AsyncClient | None = None
         self._tokens: dict[str, _CachedToken] = {}
+        # File on disk wins over env so we never use a stale .env value after
+        # the very first rotation.
+        persisted = _read_persisted_refresh_token()
+        self._refresh_token: str = persisted or self._settings.xero_refresh_token
 
     async def _http(self) -> httpx.AsyncClient:
         if self._client is None:
@@ -84,7 +144,7 @@ class XeroService:
         if cached is not None and cached.is_fresh(now):
             return cached.access_token
 
-        if self._settings.xero_refresh_token:
+        if self._refresh_token:
             return await self._refresh_with_refresh_token(now)
         return await self._refresh_with_client_credentials(now)
 
@@ -102,7 +162,7 @@ class XeroService:
             },
             data={
                 "grant_type": "refresh_token",
-                "refresh_token": self._settings.xero_refresh_token,
+                "refresh_token": self._refresh_token,
                 "client_id": self._settings.xero_client_id,
                 "client_secret": self._settings.xero_client_secret,
             },
@@ -124,11 +184,25 @@ class XeroService:
         expires_in = float(payload.get("expires_in", 1800))
 
         new_refresh = payload.get("refresh_token")
-        if new_refresh and new_refresh != self._settings.xero_refresh_token:
-            log.warning(
-                "Xero rotated the refresh token. Update XERO_REFRESH_TOKEN in .env to: %s",
-                new_refresh,
-            )
+        if new_refresh and new_refresh != self._refresh_token:
+            try:
+                _write_persisted_refresh_token(new_refresh)
+                self._refresh_token = new_refresh
+                log.warning(
+                    "Xero rotated refresh token; new value persisted to %s",
+                    _refresh_token_path(),
+                )
+            except OSError as exc:
+                # If persistence fails we still update in-memory state so the
+                # next call in this process uses the new value, but we surface
+                # a clear warning. We DO NOT log the token itself.
+                self._refresh_token = new_refresh
+                log.warning(
+                    "Xero rotated refresh token but persistence to %s failed (%s); "
+                    "token kept in memory only — restart will lose it",
+                    _refresh_token_path(),
+                    exc.__class__.__name__,
+                )
 
         self._tokens[tenant_id] = _CachedToken(access_token, now + expires_in)
         return access_token
@@ -257,6 +331,27 @@ class XeroService:
         return {"reports": reports, "count": len(reports)}
 
 
+_service: XeroService | None = None
+
+
+def _get_service() -> XeroService:
+    """Return the process-wide XeroService singleton, creating it on first call."""
+
+    global _service
+    if _service is None:
+        _service = XeroService()
+    return _service
+
+
+async def _reset_service() -> None:
+    """Discard the singleton and close its HTTP client. Test-only helper."""
+
+    global _service
+    if _service is not None:
+        await _service.aclose()
+        _service = None
+
+
 def _resolve_page_size(value: int | None, settings: MCPSettings) -> int:
     if value is None:
         return settings.tool_result_limit
@@ -285,6 +380,14 @@ async def _call(coro, source: str = "xero") -> dict[str, Any]:
     except httpx.RequestError as exc:
         return integration_error(source, f"Xero request failed: {exc.__class__.__name__}")
     return ok(source, data)
+
+
+_NOT_CONFIGURED_MESSAGE = (
+    "Xero is not configured. Set XERO_CLIENT_ID, XERO_CLIENT_SECRET, "
+    "XERO_TENANT_ID and either XERO_REFRESH_TOKEN (run "
+    "`python scripts/xero_auth_setup.py` to obtain one) or use a "
+    "Custom Connection."
+)
 
 
 async def xero_get_contacts(
@@ -316,18 +419,8 @@ async def xero_get_contacts(
         )
         settings = get_settings()
         if not settings.xero_configured:
-            return not_configured(
-                "xero",
-                "Xero is not configured. Set XERO_CLIENT_ID, XERO_CLIENT_SECRET, "
-                "XERO_TENANT_ID and either XERO_REFRESH_TOKEN (run "
-                "`python scripts/xero_auth_setup.py` to obtain one) or use a "
-                "Custom Connection.",
-            )
-        service = XeroService(settings)
-        try:
-            return await _call(service.get_contacts(page=page, page_size=page_size))
-        finally:
-            await service.aclose()
+            return not_configured("xero", _NOT_CONFIGURED_MESSAGE)
+        return await _call(_get_service().get_contacts(page=page, page_size=page_size))
 
 
 async def xero_get_invoices(
@@ -366,27 +459,17 @@ async def xero_get_invoices(
         )
         settings = get_settings()
         if not settings.xero_configured:
-            return not_configured(
-                "xero",
-                "Xero is not configured. Set XERO_CLIENT_ID, XERO_CLIENT_SECRET, "
-                "XERO_TENANT_ID and either XERO_REFRESH_TOKEN (run "
-                "`python scripts/xero_auth_setup.py` to obtain one) or use a "
-                "Custom Connection.",
+            return not_configured("xero", _NOT_CONFIGURED_MESSAGE)
+        return await _call(
+            _get_service().get_invoices(
+                status=status,
+                date_from=date_from,
+                date_to=date_to,
+                contact_id=contact_id,
+                page=page,
+                page_size=page_size,
             )
-        service = XeroService(settings)
-        try:
-            return await _call(
-                service.get_invoices(
-                    status=status,
-                    date_from=date_from,
-                    date_to=date_to,
-                    contact_id=contact_id,
-                    page=page,
-                    page_size=page_size,
-                )
-            )
-        finally:
-            await service.aclose()
+        )
 
 
 async def xero_get_payments(
@@ -417,18 +500,8 @@ async def xero_get_payments(
         )
         settings = get_settings()
         if not settings.xero_configured:
-            return not_configured(
-                "xero",
-                "Xero is not configured. Set XERO_CLIENT_ID, XERO_CLIENT_SECRET, "
-                "XERO_TENANT_ID and either XERO_REFRESH_TOKEN (run "
-                "`python scripts/xero_auth_setup.py` to obtain one) or use a "
-                "Custom Connection.",
-            )
-        service = XeroService(settings)
-        try:
-            return await _call(service.get_payments(page=page, page_size=page_size))
-        finally:
-            await service.aclose()
+            return not_configured("xero", _NOT_CONFIGURED_MESSAGE)
+        return await _call(_get_service().get_payments(page=page, page_size=page_size))
 
 
 async def xero_create_invoice(
@@ -482,18 +555,10 @@ async def xero_get_profit_loss(
         )
         settings = get_settings()
         if not settings.xero_configured:
-            return not_configured(
-                "xero",
-                "Xero is not configured. Set XERO_CLIENT_ID, XERO_CLIENT_SECRET, "
-                "XERO_TENANT_ID and either XERO_REFRESH_TOKEN (run "
-                "`python scripts/xero_auth_setup.py` to obtain one) or use a "
-                "Custom Connection.",
-            )
-        service = XeroService(settings)
-        try:
-            return await _call(service.get_profit_loss(from_date=from_date, to_date=to_date))
-        finally:
-            await service.aclose()
+            return not_configured("xero", _NOT_CONFIGURED_MESSAGE)
+        return await _call(
+            _get_service().get_profit_loss(from_date=from_date, to_date=to_date)
+        )
 
 
 def register(mcp: Any) -> None:

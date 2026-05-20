@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+from pathlib import Path
 
 import httpx
 import pytest
@@ -15,6 +16,28 @@ def _clear_settings_cache() -> None:
     mcp_config.get_settings.cache_clear()
     yield
     mcp_config.get_settings.cache_clear()
+
+
+@pytest.fixture(autouse=True)
+def _reset_xero_singleton() -> None:
+    """Discard the module-level XeroService between tests so each one starts
+    with a fresh access-token cache and no persisted refresh-token in memory."""
+
+    xero_tools._service = None
+    yield
+    xero_tools._service = None
+
+
+@pytest.fixture(autouse=True)
+def _isolated_refresh_token_file(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> Path:
+    """Redirect the persisted-refresh-token file into a per-test tmp_path so
+    tests never touch the real `.secrets/xero_refresh_token.txt`."""
+
+    path = tmp_path / "xero_refresh_token.txt"
+    monkeypatch.setenv("XERO_REFRESH_TOKEN_FILE", str(path))
+    return path
 
 
 def _set_xero_env(monkeypatch: pytest.MonkeyPatch, **overrides: str) -> None:
@@ -190,8 +213,10 @@ async def test_xero_uses_refresh_token_when_set(monkeypatch: pytest.MonkeyPatch)
 
 
 @pytest.mark.asyncio
-async def test_xero_refresh_token_rotation_logged(
-    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+async def test_xero_refresh_token_rotation_persisted_to_file(
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+    _isolated_refresh_token_file: Path,
 ) -> None:
     _set_xero_env(monkeypatch, XERO_REFRESH_TOKEN="rt-old")
     caplog.set_level(logging.WARNING, logger="agents.mcp.tools.xero_tools")
@@ -212,11 +237,41 @@ async def test_xero_refresh_token_rotation_logged(
         )
         await xero_tools.xero_get_contacts(permissions=["finance_access"])
 
-    warning_blob = "\n".join(
-        record.getMessage() for record in caplog.records if record.levelno >= logging.WARNING
+    # File persisted atomically with the new value.
+    assert _isolated_refresh_token_file.read_text(encoding="utf-8") == "rt-NEW-rotated"
+
+    # Warning was emitted but the token VALUE is not in any log message or its
+    # attributes — only the path is mentioned.
+    log_blob = "\n".join(
+        record.getMessage() + " " + str(record.__dict__) for record in caplog.records
     )
-    assert "rt-NEW-rotated" in warning_blob
-    assert "XERO_REFRESH_TOKEN" in warning_blob
+    assert "rotated refresh token" in log_blob
+    assert "rt-NEW-rotated" not in log_blob
+    assert "rt-old" not in log_blob
+
+
+@pytest.mark.asyncio
+async def test_xero_persisted_refresh_token_wins_over_env(
+    monkeypatch: pytest.MonkeyPatch, _isolated_refresh_token_file: Path
+) -> None:
+    """On startup, the file takes precedence over XERO_REFRESH_TOKEN in env."""
+
+    _set_xero_env(monkeypatch, XERO_REFRESH_TOKEN="rt-from-env-stale")
+    _isolated_refresh_token_file.parent.mkdir(parents=True, exist_ok=True)
+    _isolated_refresh_token_file.write_text("rt-from-file-fresh", encoding="utf-8")
+
+    with respx.mock(assert_all_called=True) as mock:
+        token_route = mock.post("https://identity.test/connect/token").mock(
+            return_value=httpx.Response(200, json={"access_token": "tok", "expires_in": 1800})
+        )
+        mock.get("https://api.test/api.xro/2.0/Contacts").mock(
+            return_value=httpx.Response(200, json={"Contacts": []})
+        )
+        await xero_tools.xero_get_contacts(permissions=["finance_access"])
+
+    body = token_route.calls[0].request.content.decode()
+    assert "refresh_token=rt-from-file-fresh" in body
+    assert "rt-from-env-stale" not in body
 
 
 @pytest.mark.asyncio
@@ -232,6 +287,33 @@ async def test_xero_refresh_token_invalid(monkeypatch: pytest.MonkeyPatch) -> No
     assert result["source"] == "xero"
     assert result["status"] == "error"
     assert "401" in (result["error"] or "")
+
+
+@pytest.mark.asyncio
+async def test_xero_singleton_caches_access_token_across_tool_calls(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _set_xero_env(monkeypatch, XERO_REFRESH_TOKEN="rt-stored")
+    with respx.mock(assert_all_called=True) as mock:
+        token_route = mock.post("https://identity.test/connect/token").mock(
+            return_value=httpx.Response(
+                200, json={"access_token": "tok-shared", "expires_in": 1800}
+            )
+        )
+        mock.get("https://api.test/api.xro/2.0/Contacts").mock(
+            return_value=httpx.Response(200, json={"Contacts": []})
+        )
+        mock.get("https://api.test/api.xro/2.0/Invoices").mock(
+            return_value=httpx.Response(200, json={"Invoices": []})
+        )
+
+        # Two different tool functions, called sequentially — both go through
+        # the module-level singleton, so /connect/token must fire exactly once.
+        await xero_tools.xero_get_contacts(permissions=["finance_access"])
+        await xero_tools.xero_get_invoices(permissions=["finance_access"])
+
+    assert token_route.call_count == 1
+    assert xero_tools._service is not None
 
 
 @pytest.mark.asyncio
