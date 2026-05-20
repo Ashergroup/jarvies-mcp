@@ -13,12 +13,27 @@ What this does:
    `https://api.xero.com/connections`, and prints the env block you need to
    paste into `.env`.
 
+Scopes:
+    The SCOPES constant below is the minimum set of granular scopes required
+    for Jarvies' read-only Xero tools. Xero apps created since March 2026 only
+    accept the new granular scope names — the legacy broad scopes (e.g.
+    `accounting.transactions`) will be rejected as `invalid_scope`. Each tool
+    in `agents/mcp/tools/xero_tools.py` maps to one granular scope:
+
+        xero_get_contacts     -> accounting.contacts.read
+        xero_get_invoices     -> accounting.invoices.read
+        xero_get_payments     -> accounting.payments.read
+        xero_get_profit_loss  -> accounting.reports.profitandloss.read
+
+    `offline_access` is also requested so Xero returns a refresh token.
+
 Nothing is written to disk. The dance is interactive and must be re-run if
 you ever lose your refresh token.
 """
 
 from __future__ import annotations
 
+import argparse
 import base64
 import json
 import secrets
@@ -44,20 +59,27 @@ CONNECTIONS_URL = "https://api.xero.com/connections"
 SCOPES = (
     "offline_access "
     "accounting.contacts.read "
-    "accounting.transactions.read "
-    "accounting.reports.read"
+    "accounting.invoices.read "
+    "accounting.payments.read "
+    "accounting.reports.profitandloss.read"
 )
 CALLBACK_TIMEOUT_SECONDS = 5 * 60
 
 
-def build_auth_url(client_id: str, redirect_uri: str, state: str) -> str:
-    """Build the Xero `/identity/connect/authorize` URL."""
+def build_auth_url(
+    client_id: str, redirect_uri: str, state: str, scopes: str | None = None
+) -> str:
+    """Build the Xero `/identity/connect/authorize` URL.
+
+    `scopes` overrides the module-level SCOPES default when provided
+    (used by the --scopes CLI flag for diagnosing invalid_scope errors).
+    """
 
     params = {
         "response_type": "code",
         "client_id": client_id,
         "redirect_uri": redirect_uri,
-        "scope": SCOPES,
+        "scope": scopes if scopes is not None else SCOPES,
         "state": state,
     }
     return f"{AUTHORIZE_BASE}?{urllib.parse.urlencode(params)}"
@@ -228,7 +250,27 @@ def _choose_tenant(connections: list[dict[str, Any]]) -> dict[str, Any]:
         print(f"Out of range (1..{len(connections)}).")
 
 
-def main() -> int:
+def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
+    parser = argparse.ArgumentParser(
+        description="One-time Xero OAuth2 authorization-code dance.",
+    )
+    parser.add_argument(
+        "--scopes",
+        type=str,
+        default=None,
+        help=(
+            "Override the default OAuth scopes (space-separated). Useful for "
+            "diagnosing invalid_scope errors. When omitted, the built-in "
+            "SCOPES constant is used."
+        ),
+    )
+    return parser.parse_args(argv)
+
+
+def main(argv: list[str] | None = None) -> int:
+    args = _parse_args(argv)
+    scopes = args.scopes if args.scopes is not None else SCOPES
+
     settings = get_settings()
 
     client_id = settings.xero_client_id
@@ -275,11 +317,12 @@ def main() -> int:
         probe.close()
 
     state = secrets.token_urlsafe(32)
-    auth_url = build_auth_url(client_id, redirect_uri, state)
+    auth_url = build_auth_url(client_id, redirect_uri, state, scopes)
 
     print("=" * 70)
     print("Xero OAuth2 authorization-code setup")
     print("=" * 70)
+    print(f"\nRequesting scopes: {scopes}")
     print(
         "\nOpen this URL in your browser and authorize the Jarvies app against "
         "the Xero organisation you want to connect:\n"
