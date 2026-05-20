@@ -35,8 +35,9 @@ def _set_xero_env(monkeypatch: pytest.MonkeyPatch, **overrides: str) -> None:
 async def test_xero_get_contacts_returns_not_configured_when_env_missing(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    # Override values from any locally-present .env to simulate missing creds.
     for key in ("XERO_CLIENT_ID", "XERO_CLIENT_SECRET", "XERO_TENANT_ID"):
-        monkeypatch.delenv(key, raising=False)
+        monkeypatch.setenv(key, "")
 
     result = await xero_tools.xero_get_contacts(permissions=["finance_access"])
 

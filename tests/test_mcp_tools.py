@@ -79,13 +79,24 @@ async def test_m365_search_emails_wraps_existing_tool(monkeypatch: pytest.Monkey
 
 
 @pytest.mark.asyncio
-async def test_xero_placeholder_requires_finance_access() -> None:
-    result = await xero_tools.xero_get_contacts(
-        tenant_id="tenant-a",
-        user_id="user-a",
-        permissions=["finance_access"],
-    )
-    assert result["status"] == "not_configured"
+async def test_xero_placeholder_requires_finance_access(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # Override values from any locally-present .env to simulate missing creds.
+    for key in ("XERO_CLIENT_ID", "XERO_CLIENT_SECRET", "XERO_TENANT_ID"):
+        monkeypatch.setenv(key, "")
+    from agents.mcp import config as mcp_config
+
+    mcp_config.get_settings.cache_clear()
+    try:
+        result = await xero_tools.xero_get_contacts(
+            tenant_id="tenant-a",
+            user_id="user-a",
+            permissions=["finance_access"],
+        )
+        assert result["status"] == "not_configured"
+    finally:
+        mcp_config.get_settings.cache_clear()
 
 
 def test_hello_tool_function_when_mcp_sdk_available() -> None:
