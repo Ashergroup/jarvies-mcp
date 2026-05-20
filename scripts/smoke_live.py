@@ -1,4 +1,4 @@
-"""Live smoke test for Cin7 and Freshsales MCP integrations.
+"""Live smoke test for Cin7, Freshsales, and Xero MCP integrations.
 
 Runs the tool functions directly against the real APIs using credentials
 loaded from .env. Bypasses the MCP HTTP server so we are testing only the
@@ -8,7 +8,7 @@ Usage (from the jarvies-mcp project root):
     python scripts/smoke_live.py
 
 Safety:
-    - Never prints credentials.
+    - Never prints credentials, tokens, refresh tokens, or tenant IDs.
     - Never prints full response bodies — only counts and short error snippets.
     - Read-only calls. Skips integrations that are not configured.
 """
@@ -16,7 +16,9 @@ Safety:
 from __future__ import annotations
 
 import asyncio
+import datetime
 import json
+import logging
 import sys
 import time
 from pathlib import Path
@@ -28,7 +30,7 @@ if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 from agents.mcp.config import get_settings  # noqa: E402
-from agents.mcp.tools import cin7_tools, freshsales_tools  # noqa: E402
+from agents.mcp.tools import cin7_tools, freshsales_tools, xero_tools  # noqa: E402
 
 MAX_ERROR_SNIPPET = 500
 
@@ -51,6 +53,9 @@ def _count(result: dict[str, Any]) -> int | str:
         "accounts",
         "deals",
         "results",
+        "invoices",
+        "payments",
+        "reports",
     ):
         value = data.get(key)
         if isinstance(value, list):
@@ -132,6 +137,89 @@ async def smoke_cin7(failures: list[str]) -> tuple[int, int]:
     return passed, len(sequence)
 
 
+async def smoke_xero(failures: list[str]) -> tuple[int, int]:
+    today = datetime.date.today()
+    from_date = (today - datetime.timedelta(days=90)).isoformat()
+    to_date = today.isoformat()
+
+    perms = ["finance_access"]
+    sequence: list[tuple[str, Callable[..., Awaitable[dict[str, Any]]], dict[str, Any]]] = [
+        (
+            "xero_get_contacts",
+            xero_tools.xero_get_contacts,
+            {"page": 1, "page_size": 5},
+        ),
+        (
+            "xero_get_invoices",
+            xero_tools.xero_get_invoices,
+            {"page_size": 5},
+        ),
+        (
+            "xero_get_payments",
+            xero_tools.xero_get_payments,
+            {"page_size": 5},
+        ),
+        (
+            "xero_get_profit_loss",
+            xero_tools.xero_get_profit_loss,
+            {"from_date": from_date, "to_date": to_date},
+        ),
+    ]
+
+    # The Xero integration logs the *value* of any rotated refresh token at
+    # WARNING level (by design — so MCP server operators see it). For the
+    # smoke runner we suppress that logger so tokens never reach stdout.
+    # See the report at end-of-run for the rotation count instead.
+    xero_logger = logging.getLogger("agents.mcp.tools.xero_tools")
+    previous_level = xero_logger.level
+    rotation_counter = _RotationCounter()
+    xero_logger.addFilter(rotation_counter)
+    xero_logger.setLevel(logging.ERROR)
+
+    passed = 0
+    try:
+        for tool_name, fn, kwargs in sequence:
+            call_kwargs = {**kwargs, "permissions": perms}
+            ok, result, latency = await _run_one("Xero", tool_name, fn, call_kwargs)
+            _print_call("Xero", tool_name, kwargs, result, latency)
+            if ok:
+                passed += 1
+            else:
+                failures.append(f"Xero / {tool_name}: {_short_error(result)}")
+    finally:
+        xero_logger.setLevel(previous_level)
+        xero_logger.removeFilter(rotation_counter)
+
+    if rotation_counter.count:
+        print(
+            f"    note: Xero rotated the refresh token {rotation_counter.count} "
+            "time(s) during this run. The XERO_REFRESH_TOKEN currently in your .env "
+            "is now stale. Re-run the OAuth dance or recover the latest value from "
+            "the MCP server's logs."
+        )
+    return passed, len(sequence)
+
+
+class _RotationCounter(logging.Filter):
+    """Counts (but does not record) refresh-token rotation warnings."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.count = 0
+
+    def filter(self, record: logging.LogRecord) -> bool:
+        try:
+            msg = record.getMessage()
+        except Exception:  # noqa: BLE001
+            msg = ""
+        if "rotated the refresh token" in msg:
+            self.count += 1
+        # Returning False would drop the record before formatting; we already
+        # suppress via logger level, but this is belt-and-braces in case the
+        # caller has a handler installed at INFO or below.
+        return False
+
+
 async def smoke_freshsales(failures: list[str]) -> tuple[int, int]:
     perms = ["freshsales_access"]
     sequence: list[tuple[str, Callable[..., Awaitable[dict[str, Any]]], dict[str, Any]]] = [
@@ -176,11 +264,13 @@ async def main() -> int:
     print("=" * 60)
     print(f"Cin7:        {'configured' if settings.cin7_configured else 'not configured'}")
     print(f"Freshsales:  {'configured' if settings.freshsales_configured else 'not configured'}")
+    print(f"Xero:        {'configured' if settings.xero_configured else 'not configured'}")
     print()
 
     failures: list[str] = []
     cin7_passed = cin7_total = 0
     fs_passed = fs_total = 0
+    xero_passed = xero_total = 0
 
     if settings.cin7_configured:
         print("=" * 60)
@@ -200,6 +290,15 @@ async def main() -> int:
     else:
         print("Skipping Freshsales — credentials not configured.\n")
 
+    if settings.xero_configured:
+        print("=" * 60)
+        print("Xero live smoke")
+        print("=" * 60)
+        xero_passed, xero_total = await smoke_xero(failures)
+        print()
+    else:
+        print("Skipping Xero — credentials not configured.\n")
+
     print("=" * 60)
     print("Summary")
     print("=" * 60)
@@ -211,6 +310,10 @@ async def main() -> int:
         print(f"Freshsales:  {fs_passed}/{fs_total} passed")
     else:
         print("Freshsales:  skipped (not configured)")
+    if settings.xero_configured:
+        print(f"Xero:        {xero_passed}/{xero_total} passed")
+    else:
+        print("Xero:        skipped (not configured)")
 
     if failures:
         print("\nFailures:")
