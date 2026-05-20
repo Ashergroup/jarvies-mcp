@@ -1,12 +1,22 @@
 """Xero MCP tools — read-only Accounting API access.
 
-SDK choice: raw httpx. The official `xero-python` package is built around Xero's
-authorization-code/PKCE flow for partner apps and bundles a generated OpenAPI
-client per API. We only need machine-to-machine reads via a Xero *Custom
-Connection*, which uses the standard OAuth2 `client_credentials` grant against
-`https://identity.xero.com/connect/token`. That is one POST plus an in-memory
-token cache, so the SDK's surface area is more weight than benefit here.
-Switching to `xero-python` later only changes the token + HTTP call paths.
+SDK choice: raw httpx. The official `xero-python` package bundles a generated
+OpenAPI client per API. We support two OAuth2 token paths and a small in-memory
+cache, which is one POST per refresh — the SDK's surface area is more weight
+than benefit. Switching to `xero-python` later only changes the token + HTTP
+call paths.
+
+Auth paths (chosen at call time):
+- Path A — authorization_code + refresh_token (preferred). When
+  `XERO_REFRESH_TOKEN` is set, the service refreshes against
+  `https://identity.xero.com/connect/token` with
+  `grant_type=refresh_token`. If Xero rotates the refresh token in the
+  response, we log a WARNING with the new value — the user updates `.env`
+  manually (no automatic disk writes).
+- Path B — client_credentials (Custom Connection, machine-to-machine).
+  Used as a fallback when no refresh token is set but client_id/secret/
+  tenant_id are all present. Some Xero regions don't allow Custom
+  Connections, in which case Path A is the only option.
 """
 
 from __future__ import annotations
@@ -74,6 +84,59 @@ class XeroService:
         if cached is not None and cached.is_fresh(now):
             return cached.access_token
 
+        if self._settings.xero_refresh_token:
+            return await self._refresh_with_refresh_token(now)
+        return await self._refresh_with_client_credentials(now)
+
+    async def _refresh_with_refresh_token(self, now: float) -> str:
+        """Path A — exchange the stored refresh token for a fresh access token."""
+
+        tenant_id = self._settings.xero_tenant_id
+        client = await self._http()
+        started = time.perf_counter()
+        response = await client.post(
+            self._settings.xero_identity_url,
+            headers={
+                "Content-Type": "application/x-www-form-urlencoded",
+                "Accept": "application/json",
+            },
+            data={
+                "grant_type": "refresh_token",
+                "refresh_token": self._settings.xero_refresh_token,
+                "client_id": self._settings.xero_client_id,
+                "client_secret": self._settings.xero_client_secret,
+            },
+        )
+        latency_ms = (time.perf_counter() - started) * 1000
+        log.info(
+            "xero_api_call",
+            extra={
+                "method": "POST",
+                "path": "/connect/token",
+                "grant": "refresh_token",
+                "status": response.status_code,
+                "latency_ms": round(latency_ms, 1),
+            },
+        )
+        response.raise_for_status()
+        payload = response.json()
+        access_token = payload["access_token"]
+        expires_in = float(payload.get("expires_in", 1800))
+
+        new_refresh = payload.get("refresh_token")
+        if new_refresh and new_refresh != self._settings.xero_refresh_token:
+            log.warning(
+                "Xero rotated the refresh token. Update XERO_REFRESH_TOKEN in .env to: %s",
+                new_refresh,
+            )
+
+        self._tokens[tenant_id] = _CachedToken(access_token, now + expires_in)
+        return access_token
+
+    async def _refresh_with_client_credentials(self, now: float) -> str:
+        """Path B — Custom Connection client_credentials grant (legacy fallback)."""
+
+        tenant_id = self._settings.xero_tenant_id
         basic = base64.b64encode(
             f"{self._settings.xero_client_id}:{self._settings.xero_client_secret}".encode()
         ).decode("ascii")
@@ -95,6 +158,7 @@ class XeroService:
             extra={
                 "method": "POST",
                 "path": "/connect/token",
+                "grant": "client_credentials",
                 "status": response.status_code,
                 "latency_ms": round(latency_ms, 1),
             },
@@ -252,7 +316,13 @@ async def xero_get_contacts(
         )
         settings = get_settings()
         if not settings.xero_configured:
-            return not_configured("xero", "XERO_CLIENT_ID/SECRET/TENANT_ID are not configured.")
+            return not_configured(
+                "xero",
+                "Xero is not configured. Set XERO_CLIENT_ID, XERO_CLIENT_SECRET, "
+                "XERO_TENANT_ID and either XERO_REFRESH_TOKEN (run "
+                "`python scripts/xero_auth_setup.py` to obtain one) or use a "
+                "Custom Connection.",
+            )
         service = XeroService(settings)
         try:
             return await _call(service.get_contacts(page=page, page_size=page_size))
@@ -296,7 +366,13 @@ async def xero_get_invoices(
         )
         settings = get_settings()
         if not settings.xero_configured:
-            return not_configured("xero", "XERO_CLIENT_ID/SECRET/TENANT_ID are not configured.")
+            return not_configured(
+                "xero",
+                "Xero is not configured. Set XERO_CLIENT_ID, XERO_CLIENT_SECRET, "
+                "XERO_TENANT_ID and either XERO_REFRESH_TOKEN (run "
+                "`python scripts/xero_auth_setup.py` to obtain one) or use a "
+                "Custom Connection.",
+            )
         service = XeroService(settings)
         try:
             return await _call(
@@ -341,7 +417,13 @@ async def xero_get_payments(
         )
         settings = get_settings()
         if not settings.xero_configured:
-            return not_configured("xero", "XERO_CLIENT_ID/SECRET/TENANT_ID are not configured.")
+            return not_configured(
+                "xero",
+                "Xero is not configured. Set XERO_CLIENT_ID, XERO_CLIENT_SECRET, "
+                "XERO_TENANT_ID and either XERO_REFRESH_TOKEN (run "
+                "`python scripts/xero_auth_setup.py` to obtain one) or use a "
+                "Custom Connection.",
+            )
         service = XeroService(settings)
         try:
             return await _call(service.get_payments(page=page, page_size=page_size))
@@ -400,7 +482,13 @@ async def xero_get_profit_loss(
         )
         settings = get_settings()
         if not settings.xero_configured:
-            return not_configured("xero", "XERO_CLIENT_ID/SECRET/TENANT_ID are not configured.")
+            return not_configured(
+                "xero",
+                "Xero is not configured. Set XERO_CLIENT_ID, XERO_CLIENT_SECRET, "
+                "XERO_TENANT_ID and either XERO_REFRESH_TOKEN (run "
+                "`python scripts/xero_auth_setup.py` to obtain one) or use a "
+                "Custom Connection.",
+            )
         service = XeroService(settings)
         try:
             return await _call(service.get_profit_loss(from_date=from_date, to_date=to_date))

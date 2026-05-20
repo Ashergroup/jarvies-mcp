@@ -92,6 +92,11 @@ class MCPSettings(BaseSettings):
     xero_client_id: str = Field(default="", validation_alias="XERO_CLIENT_ID")
     xero_client_secret: str = Field(default="", validation_alias="XERO_CLIENT_SECRET")
     xero_tenant_id: str = Field(default="", validation_alias="XERO_TENANT_ID")
+    xero_refresh_token: str = Field(default="", validation_alias="XERO_REFRESH_TOKEN")
+    xero_redirect_uri: str = Field(
+        default="http://localhost:8080/xero/callback",
+        validation_alias="XERO_REDIRECT_URI",
+    )
     xero_scopes: str = Field(
         default=(
             "accounting.transactions.read accounting.contacts.read "
@@ -146,10 +151,27 @@ class MCPSettings(BaseSettings):
         }
 
     @property
-    def xero_configured(self) -> bool:
-        """Return True when client-credentials Xero auth can be attempted."""
+    def xero_refresh_token_configured(self) -> bool:
+        """Return True when the auth-code-grant refresh-token path is usable."""
+
+        return bool(
+            self.xero_client_id
+            and self.xero_client_secret
+            and self.xero_refresh_token
+            and self.xero_tenant_id
+        )
+
+    @property
+    def xero_client_credentials_configured(self) -> bool:
+        """Return True when the client-credentials (Custom Connection) path is usable."""
 
         return bool(self.xero_client_id and self.xero_client_secret and self.xero_tenant_id)
+
+    @property
+    def xero_configured(self) -> bool:
+        """Return True when either Xero auth path has its inputs available."""
+
+        return self.xero_refresh_token_configured or self.xero_client_credentials_configured
 
     @property
     def cin7_configured(self) -> bool:
