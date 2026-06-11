@@ -1,0 +1,205 @@
+{
+  "lists": {
+    "fundraising_pipeline": {
+      "fields": {
+        "Application Folder URL": {
+          "type": "url",
+          "uuid": "5916e214-45cf-4178-bb91-2e5f577f6da4"
+        },
+        "Decision Date": {
+          "type": "date",
+          "uuid": "1b596734-fe32-4180-b9fd-ad2b897a7370"
+        },
+        "Estimated Amount": {
+          "type": "number",
+          "uuid": "47a5c441-7246-4182-a0a3-434343af2c24"
+        },
+        "Investor Type": {
+          "options": [
+            {
+              "name": "Grant",
+              "orderindex": 0,
+              "uuid": "04f30b96-8ec0-4cc9-bf91-82d8d0125b45"
+            },
+            {
+              "name": "Angel",
+              "orderindex": 1,
+              "uuid": "1b18c5b9-ed6d-4763-9a44-4f937f6c8115"
+            }
+          ],
+          "type": "drop_down",
+          "uuid": "f4257cea-dba8-43e2-a5ec-1ce8af3bcf7e"
+        },
+        "Lead Partner": {
+          "type": "short_text",
+          "uuid": "b8577cb8-2622-451d-b15e-7c5be8ac51c9"
+        },
+        "Probability": {
+          "options": [
+            {
+              "name": "High",
+              "orderindex": 0,
+              "uuid": "8d103620-6e0b-48d8-8bd8-7303d6a0bd01"
+            },
+            {
+              "name": "Medium",
+              "orderindex": 1,
+              "uuid": "aa9d3804-64c1-4bef-b989-fb9d4f1f93cd"
+            },
+            {
+              "name": "Low",
+              "orderindex": 2,
+              "uuid": "d1cf8c73-ece8-4c88-bc75-ac002f2263eb"
+            }
+          ],
+          "type": "drop_down",
+          "uuid": "edd4b689-6989-4440-b66f-99417905224f"
+        },
+        "Requirements Source": {
+          "type": "short_text",
+          "uuid": "e45891a6-0262-4f8f-b14d-48b700d95344"
+        },
+        "Source Funder": {
+          "type": "task_relationship",
+          "uuid": "9bc474e8-9d21-4ab2-9e36-82fe8a4baf44"
+        },
+        "Submission Deadline": {
+          "type": "date",
+          "uuid": "5aee6389-dcdc-4b99-bbab-1103a513eef6"
+        }
+      },
+      "list_id": "901215521124",
+      "statuses": [
+        "lead identified",
+        "intro requested",
+        "intro completed",
+        "proposal sent",
+        "evaluation in progress",
+        "board review",
+        "approved",
+        "declined/on hold",
+        "fund received"
+      ]
+    },
+    "investor_relations": {
+      "fields": {
+        "Application Cycle": {
+          "type": "short_text",
+          "uuid": "58a62657-6fdc-4ae7-b0ee-5c41f0bec40d"
+        },
+        "Description (fund)": {
+          "type": "text",
+          "uuid": "173aaf9a-20bc-4c0d-890b-dbafa4bce15e"
+        },
+        "Eligibility Notes": {
+          "type": "long_text",
+          "uuid": "cf55ec85-56fe-431d-9841-972478a99150"
+        },
+        "Funder Type": {
+          "options": [
+            {
+              "name": "Foundation",
+              "orderindex": 0,
+              "uuid": "35187bac-3e06-4879-aa20-c73d0c80d933"
+            },
+            {
+              "name": "DFI",
+              "orderindex": 1,
+              "uuid": "72157c2d-1758-4bf7-be9a-5dce40b534dc"
+            },
+            {
+              "name": "Government",
+              "orderindex": 2,
+              "uuid": "3c19211b-a636-4a3f-b7cc-9d12e6f459fa"
+            },
+            {
+              "name": "Corporate",
+              "orderindex": 3,
+              "uuid": "d3862157-0c82-4339-8f9c-3b460f46785e"
+            },
+            {
+              "name": "Multilateral",
+              "orderindex": 4,
+              "uuid": "2e497e62-7b04-4fa6-af09-b5bfd1c2ec6a"
+            },
+            {
+              "name": "Other",
+              "orderindex": 5,
+              "uuid": "66b82f1e-683e-4236-9429-10de801da40f"
+            }
+          ],
+          "type": "drop_down",
+          "uuid": "70f0162a-0de6-4a23-875d-a2730542c52b"
+        },
+        "Last Contact Date": {
+          "type": "short_text",
+          "uuid": "75ca91ab-8a32-473c-9316-980ad3130571"
+        },
+        "Linked Application": {
+          "type": "task_relationship",
+          "uuid": "066d78b0-dcf2-4c69-9da6-c4296476bf7a"
+        },
+        "Location Focus": {
+          "options": [
+            {
+              "name": "Europe",
+              "orderindex": 0,
+              "uuid": "13386107-1991-49c0-becc-6625268a75c3"
+            },
+            {
+              "name": "Africa",
+              "orderindex": 1,
+              "uuid": "0d0630cf-7e6b-4c2f-b3d4-34543324ced0"
+            },
+            {
+              "name": "North America",
+              "orderindex": 2,
+              "uuid": "97d9b3de-d31c-46a9-a46c-7f13949d471d"
+            },
+            {
+              "name": "Asia",
+              "orderindex": 3,
+              "uuid": "e26b7e0c-715b-423a-993d-77162f74f962"
+            },
+            {
+              "name": "South America",
+              "orderindex": 4,
+              "uuid": "777796ac-15a7-4a5a-a972-ebc9b43ab01f"
+            }
+          ],
+          "type": "drop_down",
+          "uuid": "c73b330c-d48d-41e8-a0d2-913499fedbf3"
+        },
+        "Next Eligible Date": {
+          "type": "date",
+          "uuid": "c2d71bbc-9e84-4b88-9fd5-8e07361b013b"
+        },
+        "Preferred Update Frequency": {
+          "type": "short_text",
+          "uuid": "29383072-30cc-4ac3-99b6-2da03ff01855"
+        },
+        "Primary Contact": {
+          "type": "short_text",
+          "uuid": "5855566a-5f25-49a3-99ec-4d0f4b8917b8"
+        },
+        "Sector Interest": {
+          "type": "short_text",
+          "uuid": "01b938cf-d137-4f9a-8295-25bef8090358"
+        },
+        "Typical Ticket Size": {
+          "type": "short_text",
+          "uuid": "9352c164-f931-4e6e-9027-c9066c1a9a92"
+        }
+      },
+      "list_id": "901215521156",
+      "statuses": [
+        "dormant",
+        "not a fit",
+        "active",
+        "follow-up needed",
+        "invested",
+        "complete"
+      ]
+    }
+  }
+}

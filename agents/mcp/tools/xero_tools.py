@@ -1,4 +1,4 @@
-"""Xero MCP tools — read-only Accounting API access.
+"""Xero MCP tools — Accounting API access (read tools + `xero_create_invoice`, the sole write, which creates DRAFT invoices only).
 
 SDK choice: raw httpx. The official `xero-python` package bundles a generated
 OpenAPI client per API. We support two OAuth2 token paths and a small in-memory
@@ -271,6 +271,63 @@ class XeroService:
         response.raise_for_status()
         return response.json()
 
+    async def _post(self, path: str, body: dict[str, Any]) -> dict[str, Any]:
+        token = await self._access_token()
+        client = await self._http()
+        url = f"{self._settings.xero_base_url.rstrip('/')}/{path.lstrip('/')}"
+        started = time.perf_counter()
+        response = await client.post(
+            url,
+            headers={
+                "Authorization": f"Bearer {token}",
+                "Xero-tenant-id": self._settings.xero_tenant_id,
+                "Accept": "application/json",
+                "Content-Type": "application/json",
+            },
+            json=body,
+        )
+        latency_ms = (time.perf_counter() - started) * 1000
+        log.info(
+            "xero_api_call",
+            extra={
+                "method": "POST",
+                "path": f"/api.xro/2.0/{path.lstrip('/')}",
+                "status": response.status_code,
+                "latency_ms": round(latency_ms, 1),
+            },
+        )
+        response.raise_for_status()
+        return response.json()
+
+    async def create_invoice(
+        self,
+        contact_id: str,
+        line_items: list[dict[str, Any]],
+        due_date: str,
+        reference: str,
+    ) -> dict[str, Any]:
+        body = {
+            "Type": "ACCREC",
+            "Status": "DRAFT",
+            "Contact": {"ContactID": contact_id},
+            "LineItems": line_items,
+            "DueDate": due_date,
+            "Reference": reference,
+        }
+        payload = await self._post("Invoices", body)
+        invoices = payload.get("Invoices") or []
+        if not invoices:
+            # Xero returned 200 but no Invoice — anomalous, surface loudly
+            # rather than handing back an empty success.
+            raise RuntimeError("Xero POST /Invoices returned no Invoices in payload")
+        created = invoices[0]
+        invoice_id = created.get("InvoiceID", "")
+        return {
+            "invoice_id": invoice_id,
+            "invoice_number": created.get("InvoiceNumber", ""),
+            "url": f"https://go.xero.com/app/invoicing/view/{invoice_id}" if invoice_id else "",
+        }
+
     async def get_contacts(self, page: int = 1, page_size: int | None = None) -> dict[str, Any]:
         size = _resolve_page_size(page_size, self._settings)
         payload = await self._get(
@@ -505,13 +562,38 @@ async def xero_get_payments(
 
 
 async def xero_create_invoice(
-    payload: dict[str, Any],
+    contact_id: str,
+    line_items: list[dict[str, Any]],
+    due_date: str,
+    reference: str,
     tenant_id: str | None = None,
     user_id: str | None = None,
     access_token: str | None = None,
     permissions: list[str] | None = None,
 ) -> dict[str, Any]:
-    """Create a Xero invoice — currently disabled in this read-only layer."""
+    """Create a DRAFT sales invoice (ACCREC) in Xero.
+
+    Status is hardcoded to DRAFT and Type to ACCREC — this tool never
+    authorises or sends an invoice. The result is visible in the Xero UI
+    under Business → Invoices → Drafts.
+
+    Args:
+        contact_id: Xero ContactID GUID of the customer the invoice is for.
+        line_items: Non-empty list of line item dicts. Each must include
+            `description` (str), `quantity` (number), and `unit_amount`
+            (number). Xero field names use PascalCase
+            (`Description`/`Quantity`/`UnitAmount`) — both casings are
+            accepted; lowercase keys are normalised.
+        due_date: Invoice due date as ISO `YYYY-MM-DD`.
+        reference: Free-text invoice reference shown in Xero.
+
+    Returns:
+        IntegrationResult dict. On success, `data` is
+        `{"invoice_id", "invoice_number", "url"}`. HTTP / request failures
+        return `status=error`. An anomalous empty-Invoices response from
+        Xero is raised as `RuntimeError` — that path is not expected and
+        we want it loud.
+    """
 
     context = _context(tenant_id, user_id, access_token, permissions)
     with use_tenant_context(context):
@@ -521,10 +603,61 @@ async def xero_create_invoice(
             "xero_create_invoice",
             context.permissions,
         )
-        return not_configured(
-            "xero",
-            "xero_create_invoice is intentionally read-only in this MCP layer.",
-        )
+        settings = get_settings()
+        if not settings.xero_configured:
+            return not_configured("xero", _NOT_CONFIGURED_MESSAGE)
+
+        if not isinstance(line_items, list) or not line_items:
+            return integration_error("xero", "line_items must be a non-empty list")
+        normalised: list[dict[str, Any]] = []
+        for idx, item in enumerate(line_items):
+            if not isinstance(item, dict):
+                return integration_error(
+                    "xero", f"line_items[{idx}] must be a dict"
+                )
+            description = item.get("Description", item.get("description"))
+            quantity = item.get("Quantity", item.get("quantity"))
+            unit_amount = item.get("UnitAmount", item.get("unit_amount"))
+            if description is None or quantity is None or unit_amount is None:
+                return integration_error(
+                    "xero",
+                    f"line_items[{idx}] requires description, quantity, unit_amount",
+                )
+            normalised.append(
+                {
+                    "Description": description,
+                    "Quantity": quantity,
+                    "UnitAmount": unit_amount,
+                }
+            )
+
+        try:
+            time.strptime(due_date, "%Y-%m-%d")
+        except (TypeError, ValueError):
+            return integration_error(
+                "xero", "due_date must be an ISO date (YYYY-MM-DD)"
+            )
+
+        # Duplicate the try/except shape from `_call` here rather than
+        # threading create-invoice through it — `_call` returns ok(data)
+        # but we want a shaped success payload (invoice_id, url, …) that
+        # the helper would obscure.
+        try:
+            data = await _get_service().create_invoice(
+                contact_id=contact_id,
+                line_items=normalised,
+                due_date=due_date,
+                reference=reference,
+            )
+        except httpx.HTTPStatusError as exc:
+            return integration_error(
+                "xero", f"Xero API returned HTTP {exc.response.status_code}"
+            )
+        except httpx.RequestError as exc:
+            return integration_error(
+                "xero", f"Xero request failed: {exc.__class__.__name__}"
+            )
+        return ok("xero", data)
 
 
 async def xero_get_profit_loss(

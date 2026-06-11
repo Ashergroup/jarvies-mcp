@@ -52,6 +52,36 @@ TOOL_POLICIES: dict[str, ToolPolicy] = {
     "finance_get_integration_status": ToolPolicy(required_any={"finance_access"}),
     "db_read_query": ToolPolicy(required_any={"read_only"}),
     "db_select": ToolPolicy(required_any={"read_only"}),
+    "clickup_list_tasks": ToolPolicy(required_any={"fundraising_access"}),
+    "clickup_get_task": ToolPolicy(required_any={"fundraising_access"}),
+    "clickup_get_tasks_needing_work": ToolPolicy(
+        required_any={"fundraising_access"}
+    ),
+    "clickup_list_subtasks": ToolPolicy(required_any={"fundraising_access"}),
+    "clickup_compute_pipeline_totals": ToolPolicy(
+        required_any={"fundraising_access"}
+    ),
+    "clickup_update_task_field": ToolPolicy(
+        required_any={"fundraising_access"}, write=True
+    ),
+    "clickup_set_status": ToolPolicy(
+        required_any={"fundraising_access"}, write=True
+    ),
+    "clickup_link_tasks": ToolPolicy(
+        required_any={"fundraising_access"}, write=True
+    ),
+    "clickup_add_comment": ToolPolicy(
+        required_any={"fundraising_access"}, write=True
+    ),
+    "clickup_create_subtask": ToolPolicy(
+        required_any={"fundraising_access"}, write=True
+    ),
+    "clickup_complete_subtask": ToolPolicy(
+        required_any={"fundraising_access"}, write=True
+    ),
+    "clickup_reopen_subtask": ToolPolicy(
+        required_any={"fundraising_access"}, write=True
+    ),
 }
 
 

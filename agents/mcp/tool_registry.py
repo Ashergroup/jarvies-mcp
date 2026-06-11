@@ -7,6 +7,7 @@ from typing import Any
 
 from agents.mcp.tools import (
     cin7_tools,
+    clickup_tools,
     db_tools,
     finance_tools,
     freshsales_tools,
@@ -29,6 +30,7 @@ def register_all_tools(mcp: Any) -> None:
         powerbi_tools,
         finance_tools,
         db_tools,
+        clickup_tools,
     ):
         module.register(mcp)
         log.info("mcp_tools_registered", extra={"tool_module": module.__name__})

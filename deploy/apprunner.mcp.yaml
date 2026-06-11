@@ -1,3 +1,13 @@
+# AWS App Runner build/run config for the Jarvies MCP server.
+# Deploy region: eu-west-1 (Ireland). Source: GitHub (private repo).
+#
+# Two kinds of env vars below:
+#   1. Non-secret deterministic config — set here with real values.
+#   2. Secrets / per-environment values — declared as COMMENTED entries only.
+#      Set their real values in the App Runner Console (Configuration ->
+#      Environment variables) BEFORE the first deploy. They are intentionally
+#      not given placeholder values here so an empty literal can never clobber
+#      a Console-injected value, and so no secret ever lands in Git.
 version: 1.0
 runtime: python311
 build:
@@ -12,9 +22,69 @@ run:
     port: 8080
     env: PORT
   env:
+    # ── Deterministic non-secret config ──
     - name: PORT
       value: "8080"
     - name: ENVIRONMENT
       value: "production"
+    - name: MCP_LOG_LEVEL
+      value: "INFO"
+    # Auth bypass is force-disabled in production by the app regardless of this,
+    # but we pin it false for clarity.
     - name: MCP_ALLOW_UNAUTHENTICATED
       value: "false"
+    # Default tool context. Do NOT include admin_access here — callers should
+    # pass explicit permissions per request. read_only is a safe default floor.
+    - name: MCP_DEFAULT_TENANT_ID
+      value: "production"
+    - name: MCP_DEFAULT_USER_ID
+      value: "service"
+    - name: MCP_DEFAULT_PERMISSIONS
+      value: "read_only"
+    # ClickUp field map is committed to the repo; this path is inside the
+    # container working directory (/app) after the source build.
+    - name: CLICKUP_CUSTOM_FIELDS_CONFIG_PATH
+      value: ".config/clickup_fields.json"
+    - name: MCP_DB_READONLY
+      value: "true"
+
+    # ── Secrets / per-environment values — SET THESE IN THE APP RUNNER CONSOLE ──
+    # Each name below is REQUIRED (or required for the noted integration). Leave
+    # commented here; add the real value as a Console environment variable.
+    #
+    # Core auth — REQUIRED (server returns 503 in production without a key):
+    # - name: MCP_API_KEYS                 # comma-separated; long random values
+    #
+    # M365 agent runtime — REQUIRED by the bot package when M365 tools are used.
+    # NOTE: M365 tools need the external agents.m365 package, which is NOT bundled
+    # in this deploy. They will error until that package is added in Phase 2+.
+    # - name: ANTHROPIC_API_KEY
+    #
+    # Azure / M365 — declared for Phase 2 OAuth; harmless if unset in Phase 1:
+    # - name: AZURE_CLIENT_ID
+    # - name: AZURE_CLIENT_SECRET
+    # - name: AZURE_TENANT_ID
+    #
+    # PostgreSQL — OPTIONAL. Set only when DB tools are enabled. Use a dedicated
+    # read-only role.
+    # - name: DATABASE_URL
+    #
+    # ClickUp (fundraising) — REQUIRED for ClickUp tools:
+    # - name: CLICKUP_API_TOKEN
+    # - name: CLICKUP_TEAM_ID
+    # - name: CLICKUP_IR_LIST_ID
+    # - name: CLICKUP_PIPELINE_LIST_ID
+    #
+    # Xero — set if the Xero integration is in use:
+    # - name: XERO_CLIENT_ID
+    # - name: XERO_CLIENT_SECRET
+    # - name: XERO_REFRESH_TOKEN
+    # - name: XERO_TENANT_ID
+    #
+    # Cin7 — set if the Cin7 integration is in use:
+    # - name: CIN7_ACCOUNT_ID
+    # - name: CIN7_API_KEY
+    #
+    # Freshsales — set if the Freshsales integration is in use:
+    # - name: FRESHSALES_DOMAIN
+    # - name: FRESHSALES_API_KEY

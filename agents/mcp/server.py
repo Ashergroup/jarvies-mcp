@@ -9,7 +9,7 @@ from typing import Any
 from mcp.server.fastmcp import FastMCP
 from starlette.responses import JSONResponse
 
-from agents.mcp.auth import MCPAuthMiddleware
+from agents.mcp.auth import MCPAuthMiddleware, log_production_safety_warnings
 from agents.mcp.config import get_settings
 from agents.mcp.tool_registry import register_all_tools
 
@@ -27,6 +27,7 @@ def configure_logging() -> None:
 
 configure_logging()
 log = logging.getLogger(__name__)
+log_production_safety_warnings()
 
 mcp = FastMCP(
     "jarvies",

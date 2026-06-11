@@ -14,8 +14,12 @@ __pycache__/
 venv/
 env/
 
+# Node
+node_modules/
+
 # Logs
 *.log
+logs/
 mcp-server.*.log
 
 # Editor / IDE
@@ -23,12 +27,31 @@ mcp-server.*.log
 .idea/
 *.swp
 .DS_Store
+Thumbs.db
 
-# Pytest / coverage
+# Caches
 .pytest_cache/
+.mypy_cache/
+.ruff_cache/
 .coverage
 htmlcov/
 
 # Build artefacts
 build/
 dist/
+
+# Local config — environment-specific. The committed exception below
+# (.config/clickup_fields.json) holds only ClickUp field/list UUIDs, no secrets,
+# and is required by the deployed container.
+.config/*
+!.config/clickup_fields.json
+
+# Local smoke-test scratch dumps (may contain real API response data — never commit)
+contacts.json
+create_invoice.json
+create_result.json
+get_contacts.json
+init.json
+init_body.json
+init_headers.txt
+initd.json

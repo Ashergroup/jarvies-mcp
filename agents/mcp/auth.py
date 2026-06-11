@@ -26,6 +26,42 @@ log = logging.getLogger(__name__)
 PUBLIC_PATHS = {"/health", "/"}
 
 
+def log_production_safety_warnings() -> None:
+    """Warn loudly about unsafe production configuration. Never raises.
+
+    Called once at startup. In production this surfaces two classes of mistake
+    that would otherwise only show up as runtime auth behaviour:
+      - no API key / JWT secret configured (the /mcp endpoint will 503), and
+      - `admin_access` baked into the default permission set (every credential-
+        less call would run with full write access).
+    """
+
+    settings = get_settings()
+    if not settings.is_production:
+        return
+
+    if not settings.api_key_values and not settings.jwt_secret:
+        log.error(
+            "mcp_production_no_auth_configured: ENVIRONMENT=production but neither "
+            "MCP_API_KEYS nor MCP_JWT_SECRET is set; /mcp will return 503 until one "
+            "is configured."
+        )
+
+    if "admin_access" in settings.default_permission_values:
+        log.error(
+            "mcp_production_admin_default_permissions: MCP_DEFAULT_PERMISSIONS includes "
+            "admin_access in production; callers without explicit permissions would run "
+            "with full write access. Remove admin_access from the default set."
+        )
+
+    if settings.allow_unauthenticated:
+        log.warning(
+            "mcp_production_allow_unauthenticated_set: MCP_ALLOW_UNAUTHENTICATED=true is "
+            "ignored in production (auth stays enforced), but it should be false to avoid "
+            "confusion."
+        )
+
+
 class MCPAuthMiddleware(BaseHTTPMiddleware):
     """Reject unauthenticated MCP HTTP requests.
 

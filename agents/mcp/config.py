@@ -123,6 +123,23 @@ class MCPSettings(BaseSettings):
     freshsales_domain: str = Field(default="", validation_alias="FRESHSALES_DOMAIN")
     freshsales_api_key: str = Field(default="", validation_alias="FRESHSALES_API_KEY")
 
+    clickup_api_token: str = Field(default="", validation_alias="CLICKUP_API_TOKEN")
+    clickup_team_id: str = Field(default="", validation_alias="CLICKUP_TEAM_ID")
+    clickup_ir_list_id: str = Field(
+        default="", validation_alias="CLICKUP_IR_LIST_ID"
+    )
+    clickup_pipeline_list_id: str = Field(
+        default="", validation_alias="CLICKUP_PIPELINE_LIST_ID"
+    )
+    clickup_custom_fields_config_path: str = Field(
+        default=".config/clickup_fields.json",
+        validation_alias="CLICKUP_CUSTOM_FIELDS_CONFIG_PATH",
+    )
+    clickup_base_url: str = Field(
+        default="https://api.clickup.com/api/v2",
+        validation_alias="CLICKUP_BASE_URL",
+    )
+
     @field_validator("api_keys", "default_permissions")
     @classmethod
     def _strip_csv(cls, value: str) -> str:
@@ -184,6 +201,15 @@ class MCPSettings(BaseSettings):
         """Return True when Freshsales API credentials are present."""
 
         return bool(self.freshsales_domain and self.freshsales_api_key)
+
+    @property
+    def clickup_fields_config_path(self) -> Path:
+        """Absolute Path to the ClickUp custom-fields config JSON."""
+
+        path = Path(self.clickup_custom_fields_config_path)
+        if path.is_absolute():
+            return path
+        return Path.cwd() / path
 
 
 @lru_cache
