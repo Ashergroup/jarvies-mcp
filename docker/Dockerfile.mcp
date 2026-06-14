@@ -17,6 +17,14 @@ RUN pip install --no-cache-dir --upgrade pip \
     && pip install --no-cache-dir -e . \
     && pip install --no-cache-dir "mcp[cli]"
 
+# Runtime data copied after the dependency layer so it stays cached when only
+# these change:
+#  - .config/clickup_fields.json: ClickUp field/list UUIDs (no secrets). The
+#    field schema is loaded regardless of tenant, so ClickUp tools need it.
+#  - scripts/: ops scripts incl. migrate.py, runnable via `aws ecs execute-command`.
+COPY .config ./.config
+COPY scripts ./scripts
+
 # If the existing M365 bot code is not part of the same build context, copy or
 # mount it into the image and set M365_AGENT_PATH to that location.
 # Example:
