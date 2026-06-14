@@ -45,6 +45,7 @@ import httpx
 
 from agents.mcp.config import MCPSettings, get_settings
 from agents.mcp.permissions import check_permission
+from agents.mcp.tenant import current_tenant, get_tenant_credentials
 from agents.mcp.tenant_context import build_tenant_context, use_tenant_context
 
 log = logging.getLogger(__name__)
@@ -673,6 +674,36 @@ def _context(
     )
 
 
+async def _resolve_settings() -> MCPSettings:
+    """Return settings with per-tenant ClickUp credentials overlaid when a
+    tenant has been resolved for this request (via the ``X-Tenant-ID`` header);
+    otherwise the base env-var settings unchanged.
+
+    Backward compatible: with no tenant context (the Claude Desktop /
+    X-API-Key path, and all existing tests) this returns ``get_settings()``
+    untouched, so env-var credentials remain in force.
+    """
+
+    base = get_settings()
+    tenant = current_tenant()
+    if not tenant:
+        return base
+    creds = await get_tenant_credentials(tenant["id"], "clickup")
+    if not creds:
+        return base
+    meta = creds.get("metadata") or {}
+    return base.model_copy(
+        update={
+            "clickup_api_token": creds.get("credential_key") or base.clickup_api_token,
+            "clickup_team_id": meta.get("team_id") or base.clickup_team_id,
+            "clickup_ir_list_id": meta.get("ir_list_id") or base.clickup_ir_list_id,
+            "clickup_pipeline_list_id": (
+                meta.get("pipeline_list_id") or base.clickup_pipeline_list_id
+            ),
+        }
+    )
+
+
 async def _run(fn, tool_name: str, settings: MCPSettings) -> dict[str, Any]:
     service = ClickUpService(settings)
     try:
@@ -723,7 +754,7 @@ async def clickup_list_tasks(
             "clickup_list_tasks",
             context.permissions,
         )
-        settings = get_settings()
+        settings = await _resolve_settings()
         missing = _missing_runtime(settings)
         if missing:
             return _not_configured(missing)
@@ -790,7 +821,7 @@ async def clickup_get_task(
             "clickup_get_task",
             context.permissions,
         )
-        settings = get_settings()
+        settings = await _resolve_settings()
         missing = _missing_runtime(settings)
         if missing:
             return _not_configured(missing)
@@ -845,7 +876,7 @@ async def clickup_get_tasks_needing_work(
             "clickup_get_tasks_needing_work",
             context.permissions,
         )
-        settings = get_settings()
+        settings = await _resolve_settings()
         missing = _missing_runtime(settings)
         if missing:
             return _not_configured(missing)
@@ -907,7 +938,7 @@ async def clickup_list_subtasks(
             "clickup_list_subtasks",
             context.permissions,
         )
-        settings = get_settings()
+        settings = await _resolve_settings()
         missing = _missing_runtime(settings)
         if missing:
             return _not_configured(missing)
@@ -955,7 +986,7 @@ async def clickup_compute_pipeline_totals(
             "clickup_compute_pipeline_totals",
             context.permissions,
         )
-        settings = get_settings()
+        settings = await _resolve_settings()
         missing = _missing_runtime(settings)
         if missing:
             return _not_configured(missing)
@@ -1038,7 +1069,7 @@ async def clickup_update_task_field(
             "clickup_update_task_field",
             context.permissions,
         )
-        settings = get_settings()
+        settings = await _resolve_settings()
         missing = _missing_runtime(settings)
         if missing:
             return _not_configured(missing)
@@ -1106,7 +1137,7 @@ async def clickup_set_status(
             "clickup_set_status",
             context.permissions,
         )
-        settings = get_settings()
+        settings = await _resolve_settings()
         missing = _missing_runtime(settings)
         if missing:
             return _not_configured(missing)
@@ -1175,7 +1206,7 @@ async def clickup_link_tasks(
             "clickup_link_tasks",
             context.permissions,
         )
-        settings = get_settings()
+        settings = await _resolve_settings()
         missing = _missing_runtime(settings)
         if missing:
             return _not_configured(missing)
@@ -1249,7 +1280,7 @@ async def clickup_add_comment(
             "clickup_add_comment",
             context.permissions,
         )
-        settings = get_settings()
+        settings = await _resolve_settings()
         missing = _missing_runtime(settings)
         if missing:
             return _not_configured(missing)
@@ -1298,7 +1329,7 @@ async def clickup_create_subtask(
             "clickup_create_subtask",
             context.permissions,
         )
-        settings = get_settings()
+        settings = await _resolve_settings()
         missing = _missing_runtime(settings)
         if missing:
             return _not_configured(missing)
@@ -1399,7 +1430,7 @@ async def _set_subtask_status(
             tool_name,
             context.permissions,
         )
-        settings = get_settings()
+        settings = await _resolve_settings()
         missing = _missing_runtime(settings)
         if missing:
             return _not_configured(missing)
