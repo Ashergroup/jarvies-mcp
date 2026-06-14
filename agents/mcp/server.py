@@ -11,10 +11,13 @@ from typing import Any
 from mcp.server.fastmcp import FastMCP
 from starlette.responses import JSONResponse
 
+from starlette.routing import Route
+
 from agents.mcp.auth import MCPAuthMiddleware, log_production_safety_warnings
 from agents.mcp.config import get_settings
 from agents.mcp.database import close_pool, init_pool
 from agents.mcp.oauth import register_oauth_routes
+from agents.mcp.proxy import ForwardedProtoMiddleware
 from agents.mcp.tenant import TenantResolutionMiddleware
 from agents.mcp.tool_registry import register_all_tools
 
@@ -51,11 +54,24 @@ register_all_tools(mcp)
 
 app = mcp.streamable_http_app()
 
-# Tenant resolution runs inside auth (added first => inner layer). Auth is the
-# outermost middleware so unauthenticated requests are rejected before any DB
-# tenant lookup happens.
+# FastMCP mounts the Streamable HTTP endpoint at "/mcp" (no trailing slash).
+# Clients that POST to "/mcp/" would otherwise hit Starlette's redirect_slashes
+# and get a 307 to "/mcp" — and behind TLS-terminating ECS/App Runner that
+# Location came back as http://, downgrading the scheme and breaking the client.
+# Serve both paths directly and turn the slash redirect off so no redirect is
+# emitted at all. (ForwardedProtoMiddleware below also keeps any URL we generate
+# on https.)
+_mcp_route = next(r for r in app.router.routes if getattr(r, "path", None) == "/mcp")
+app.router.routes.append(Route("/mcp/", endpoint=_mcp_route.endpoint))
+app.router.redirect_slashes = False
+
+# Tenant resolution runs inside auth (added first => inner layer). Auth wraps it.
+# ForwardedProtoMiddleware is added last so it is the OUTERMOST layer: it fixes
+# scope["scheme"] from X-Forwarded-Proto before routing, auth, or the OAuth
+# discovery handlers build any absolute URL.
 app.add_middleware(TenantResolutionMiddleware)
 app.add_middleware(MCPAuthMiddleware)
+app.add_middleware(ForwardedProtoMiddleware)
 
 
 # Wrap FastMCP's own lifespan (it manages the MCP session manager) so the DB
