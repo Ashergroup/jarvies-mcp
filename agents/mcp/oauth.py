@@ -380,11 +380,17 @@ async def _exchange_ms_code(code: str, ms_code_verifier: str) -> dict[str, Any]:
             client_credential=settings.azure_client_secret,
             authority=settings.azure_authority,
         )
+        # Pass code_verifier via the `data` dict, not as a keyword argument.
+        # MSAL merges `data` into the token-exchange POST body sent to Microsoft
+        # (which is where PKCE needs it). Passing code_verifier= directly forwards
+        # it through **kwargs down to the HTTP layer, raising
+        # "Session.request() got an unexpected keyword argument 'code_verifier'".
+        # The `data` form is also stable across MSAL versions.
         return client.acquire_token_by_authorization_code(
             code,
             scopes=MSAL_SCOPES,
             redirect_uri=settings.azure_redirect_uri,
-            code_verifier=ms_code_verifier,
+            data={"code_verifier": ms_code_verifier},
         )
 
     return await anyio.to_thread.run_sync(functools.partial(_do))

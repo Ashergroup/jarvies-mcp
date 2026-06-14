@@ -161,6 +161,37 @@ def test_authorize_requires_pkce() -> None:
 # ---------------------------------------------------------------------------
 
 
+def test_exchange_ms_code_passes_code_verifier_in_data(monkeypatch: pytest.MonkeyPatch) -> None:
+    """code_verifier must go inside the `data` dict, never as a bare kwarg.
+
+    Regression: a bare code_verifier= is forwarded through MSAL's **kwargs to
+    Session.request() and raises TypeError in the container's MSAL.
+    """
+
+    import anyio
+
+    captured: dict[str, object] = {}
+
+    class FakeClient:
+        def __init__(self, *args, **kwargs) -> None:
+            pass
+
+        def acquire_token_by_authorization_code(self, code, **kwargs):
+            captured["code"] = code
+            captured["kwargs"] = kwargs
+            return {"access_token": "ms-access", "id_token_claims": {}}
+
+    import msal
+
+    monkeypatch.setattr(msal, "ConfidentialClientApplication", FakeClient)
+
+    result = anyio.run(oauth._exchange_ms_code, "ms-auth-code", "the-verifier")
+
+    assert result["access_token"] == "ms-access"
+    assert "code_verifier" not in captured["kwargs"], "must not be a bare kwarg"
+    assert captured["kwargs"]["data"] == {"code_verifier": "the-verifier"}
+
+
 def test_callback_invalid_state_returns_404() -> None:
     resp = _oauth_client().get(
         "/auth/callback",
