@@ -69,6 +69,19 @@ def test_discovery_shape(path: str) -> None:
     }
 
 
+def test_protected_resource_metadata_points_at_auth_server() -> None:
+    resp = _oauth_client().get("/.well-known/oauth-protected-resource")
+    assert resp.status_code == 200
+    body = resp.json()
+    base = "http://testserver"
+    assert body == {
+        "resource": base,
+        "authorization_servers": [base],
+        "scopes_supported": ["mcp"],
+        "bearer_methods_supported": ["header"],
+    }
+
+
 def test_register_returns_static_client() -> None:
     resp = _oauth_client().post("/register", json={"client_name": "claude"})
     assert resp.status_code == 200
@@ -243,6 +256,24 @@ def test_bearer_valid_jwt_sets_request_state_tenant(monkeypatch: pytest.MonkeyPa
     resp = client.get("/protected", headers={"Authorization": f"Bearer {token}"})
     assert resp.status_code == 200
     assert resp.json()["tenant"] == FAKE_TENANT
+
+
+def test_protected_resource_is_public_but_root_is_not() -> None:
+    from agents.mcp.auth import PUBLIC_PATHS
+
+    assert "/.well-known/oauth-protected-resource" in PUBLIC_PATHS
+    # Root serves the MCP endpoint and must stay protected to drive OAuth.
+    assert "/" not in PUBLIC_PATHS
+
+
+def test_unauthorized_response_carries_resource_metadata_challenge() -> None:
+    client = TestClient(_protected_app())
+    resp = client.get("/protected")
+    assert resp.status_code == 401
+    challenge = resp.headers["www-authenticate"]
+    assert challenge.startswith("Bearer ")
+    assert 'resource_metadata="' in challenge
+    assert challenge.endswith('/.well-known/oauth-protected-resource"')
 
 
 def test_bearer_expired_jwt_returns_401() -> None:

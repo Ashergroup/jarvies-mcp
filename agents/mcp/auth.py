@@ -24,7 +24,10 @@ except Exception:  # pragma: no cover - exercised only when dependency is absent
 log = logging.getLogger(__name__)
 
 
-PUBLIC_PATHS = {"/health", "/"} | OAUTH_PUBLIC_PATHS
+# Note: "/" is intentionally NOT public. The MCP Streamable HTTP endpoint is
+# served at the root (claude.ai POSTs there), so an unauthenticated request must
+# get a 401 with a WWW-Authenticate challenge to start the OAuth flow.
+PUBLIC_PATHS = {"/health"} | OAUTH_PUBLIC_PATHS
 
 
 def log_production_safety_warnings() -> None:
@@ -115,7 +118,24 @@ class MCPAuthMiddleware(BaseHTTPMiddleware):
         return JSONResponse(
             {"error": "unauthorized", "message": "Missing or invalid MCP credentials."},
             status_code=401,
+            headers={"WWW-Authenticate": _www_authenticate(request)},
         )
+
+
+def _www_authenticate(request: Request) -> str:
+    """Build the RFC 9728 Bearer challenge pointing at the resource metadata.
+
+    Directs the MCP client to /.well-known/oauth-protected-resource so it can
+    discover the authorization server and run the OAuth flow.
+    """
+
+    settings = get_settings()
+    base = (
+        settings.public_base_url.rstrip("/")
+        if settings.public_base_url
+        else str(request.base_url).rstrip("/")
+    )
+    return f'Bearer resource_metadata="{base}/.well-known/oauth-protected-resource"'
 
 
 def _bearer_token(request: Request) -> str | None:

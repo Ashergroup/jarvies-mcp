@@ -159,6 +159,24 @@ def _discovery_document(base_url: str) -> dict[str, Any]:
     }
 
 
+def _protected_resource_document(base_url: str) -> dict[str, Any]:
+    """RFC 9728 protected-resource metadata.
+
+    Tells the MCP client (claude.ai) which authorization server guards this
+    resource. We are both the resource and the auth server, so both point at the
+    same base URL. ``resource`` is the URL the client connected to (the server
+    root — claude.ai POSTs MCP to ``/``), which it echoes as the RFC 8707
+    ``resource`` parameter when requesting a token.
+    """
+
+    return {
+        "resource": base_url,
+        "authorization_servers": [base_url],
+        "scopes_supported": ["mcp"],
+        "bearer_methods_supported": ["header"],
+    }
+
+
 # ---------------------------------------------------------------------------
 # Discovery + registration
 # ---------------------------------------------------------------------------
@@ -171,6 +189,10 @@ async def oauth_metadata(request: Request) -> JSONResponse:
 async def openid_configuration(request: Request) -> JSONResponse:
     # claude.ai probes both; identical content.
     return JSONResponse(_discovery_document(_base_url(request)))
+
+
+async def protected_resource_metadata(request: Request) -> JSONResponse:
+    return JSONResponse(_protected_resource_document(_base_url(request)))
 
 
 async def register(request: Request) -> JSONResponse:
@@ -448,6 +470,7 @@ async def token(request: Request) -> JSONResponse:
 OAUTH_PUBLIC_PATHS = {
     "/.well-known/oauth-authorization-server",
     "/.well-known/openid-configuration",
+    "/.well-known/oauth-protected-resource",
     "/register",
     "/authorize",
     "/auth/callback",
@@ -459,6 +482,11 @@ def get_oauth_routes() -> list[Route]:
     return [
         Route("/.well-known/oauth-authorization-server", oauth_metadata, methods=["GET"]),
         Route("/.well-known/openid-configuration", openid_configuration, methods=["GET"]),
+        Route(
+            "/.well-known/oauth-protected-resource",
+            protected_resource_metadata,
+            methods=["GET"],
+        ),
         Route("/register", register, methods=["POST"]),
         Route("/authorize", authorize, methods=["GET"]),
         Route("/auth/callback", auth_callback, methods=["GET"]),

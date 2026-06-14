@@ -84,6 +84,14 @@ _mcp_route = next(r for r in app.router.routes if getattr(r, "path", None) == "/
 app.router.routes.append(Route("/mcp/", endpoint=_mcp_route.endpoint))
 app.router.redirect_slashes = False
 
+# claude.ai's connector POSTs MCP to the server root ("/") — the URL the user
+# enters — rather than "/mcp". The Streamable HTTP transport has no discovery
+# field that redirects the MCP path (the endpoint IS the configured URL), so
+# serve the same handler at "/" too. Root stays auth-protected (it is NOT in
+# auth.PUBLIC_PATHS) so an unauthenticated POST / returns 401, which is what
+# drives claude.ai into the OAuth discovery handshake.
+app.router.routes.append(Route("/", endpoint=_mcp_route.endpoint))
+
 # Tenant resolution runs inside auth (added first => inner layer). Auth wraps it.
 # ForwardedProtoMiddleware is added last so it is the OUTERMOST layer: it fixes
 # scope["scheme"] from X-Forwarded-Proto before routing, auth, or the OAuth
