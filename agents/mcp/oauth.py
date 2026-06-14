@@ -196,17 +196,46 @@ async def protected_resource_metadata(request: Request) -> JSONResponse:
 
 
 async def register(request: Request) -> JSONResponse:
-    """Permissive RFC 7591 dynamic registration: every caller gets one client."""
+    """Permissive RFC 7591 dynamic registration: every caller gets one client.
 
-    return JSONResponse(
-        {
-            "client_id": STATIC_CLIENT_ID,
-            "client_secret": STATIC_CLIENT_SECRET,
-            "token_endpoint_auth_method": "none",
-            "grant_types": ["authorization_code"],
-            "response_types": ["code"],
-        }
-    )
+    The response MUST echo the caller's ``redirect_uris`` — claude.ai validates
+    that the registered redirects match what it sent and aborts the flow (never
+    reaching /authorize) if they are absent. We accept any redirect the client
+    asks for, so we register exactly what was requested. ``client_secret`` is
+    empty and ``token_endpoint_auth_method`` is "none": this is a public client
+    that authenticates with PKCE, not a secret.
+    """
+
+    try:
+        body = await request.json()
+    except Exception:
+        body = {}
+    if not isinstance(body, dict):
+        body = {}
+
+    redirect_uris = body.get("redirect_uris")
+    if not isinstance(redirect_uris, list):
+        redirect_uris = []
+
+    response: dict[str, Any] = {
+        "client_id": STATIC_CLIENT_ID,
+        "client_secret": STATIC_CLIENT_SECRET,
+        "client_id_issued_at": int(time.time()),
+        "client_secret_expires_at": 0,  # 0 = never expires (RFC 7591).
+        "redirect_uris": redirect_uris,
+        # Only advertise what the server actually supports, matching the
+        # authorization-server discovery document.
+        "grant_types": ["authorization_code"],
+        "response_types": ["code"],
+        "token_endpoint_auth_method": "none",
+    }
+    if body.get("client_name"):
+        response["client_name"] = body["client_name"]
+    if body.get("scope"):
+        response["scope"] = body["scope"]
+
+    # RFC 7591 success status is 201 Created.
+    return JSONResponse(response, status_code=201)
 
 
 # ---------------------------------------------------------------------------

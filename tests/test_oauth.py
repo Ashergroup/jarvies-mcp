@@ -83,11 +83,28 @@ def test_protected_resource_metadata_points_at_auth_server() -> None:
 
 
 def test_register_returns_static_client() -> None:
-    resp = _oauth_client().post("/register", json={"client_name": "claude"})
-    assert resp.status_code == 200
+    resp = _oauth_client().post(
+        "/register",
+        json={
+            "client_name": "claude",
+            "redirect_uris": ["https://claude.ai/api/mcp/auth_callback"],
+        },
+    )
+    assert resp.status_code == 201
     body = resp.json()
     assert body["client_id"] == "jarvies-claude-client"
     assert body["client_secret"] == ""
+    assert body["token_endpoint_auth_method"] == "none"
+    assert body["grant_types"] == ["authorization_code"]
+    # The caller's redirect_uris MUST be echoed back, or claude.ai aborts.
+    assert body["redirect_uris"] == ["https://claude.ai/api/mcp/auth_callback"]
+    assert body["client_name"] == "claude"
+
+
+def test_register_without_redirect_uris_returns_empty_list() -> None:
+    resp = _oauth_client().post("/register", json={"client_name": "claude"})
+    assert resp.status_code == 201
+    assert resp.json()["redirect_uris"] == []
 
 
 # ---------------------------------------------------------------------------
