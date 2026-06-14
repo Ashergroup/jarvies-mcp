@@ -9,8 +9,8 @@ from contextlib import asynccontextmanager
 from typing import Any
 
 from mcp.server.fastmcp import FastMCP
+from mcp.server.transport_security import TransportSecuritySettings
 from starlette.responses import JSONResponse
-
 from starlette.routing import Route
 
 from agents.mcp.auth import MCPAuthMiddleware, log_production_safety_warnings
@@ -37,9 +37,28 @@ configure_logging()
 log = logging.getLogger(__name__)
 log_production_safety_warnings()
 
+_settings = get_settings()
+
+# FastMCP's DNS-rebinding protection rejects POST /mcp with 421 "Invalid Host"
+# unless the request Host is allowlisted. Behind ECS the public domain
+# (ja-...on.aws) is not localhost, so it must be added; the allowlist is derived
+# from JARVIES_PUBLIC_URL / AZURE_REDIRECT_URI plus MCP_ALLOWED_HOSTS. Protection
+# stays on unless explicitly disabled.
 mcp = FastMCP(
     "jarvies",
     json_response=True,
+    transport_security=TransportSecuritySettings(
+        enable_dns_rebinding_protection=not _settings.disable_dns_rebinding_protection,
+        allowed_hosts=_settings.allowed_host_values,
+        allowed_origins=_settings.allowed_origin_values,
+    ),
+)
+log.info(
+    "mcp_transport_security_configured",
+    extra={
+        "dns_rebinding_protection": not _settings.disable_dns_rebinding_protection,
+        "allowed_hosts": _settings.allowed_host_values,
+    },
 )
 
 

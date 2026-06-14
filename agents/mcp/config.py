@@ -9,6 +9,7 @@ from __future__ import annotations
 from functools import lru_cache
 from pathlib import Path
 from typing import Literal
+from urllib.parse import urlsplit
 
 from pydantic import Field, field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
@@ -66,6 +67,18 @@ class MCPSettings(BaseSettings):
     # Optional override for the OAuth issuer / discovery base URL. When empty the
     # URL is derived from the incoming request.
     public_base_url: str = Field(default="", validation_alias="JARVIES_PUBLIC_URL")
+
+    # FastMCP's DNS-rebinding protection rejects POST /mcp with 421 "Invalid Host"
+    # unless the request Host is allowlisted. CSV of extra exact hosts or
+    # "host:*" port-wildcard patterns; the deployment host is also derived from
+    # JARVIES_PUBLIC_URL / AZURE_REDIRECT_URI automatically (see
+    # allowed_host_values). Set this to disable the check entirely only if you
+    # understand the rebinding risk.
+    allowed_hosts: str = Field(default="", validation_alias="MCP_ALLOWED_HOSTS")
+    disable_dns_rebinding_protection: bool = Field(
+        default=False,
+        validation_alias="MCP_DISABLE_DNS_REBINDING_PROTECTION",
+    )
 
     default_tenant_id: str = Field(default="local", validation_alias="MCP_DEFAULT_TENANT_ID")
     default_user_id: str = Field(default="local-user", validation_alias="MCP_DEFAULT_USER_ID")
@@ -165,6 +178,48 @@ class MCPSettings(BaseSettings):
         """Return True when the server is running in production mode."""
 
         return self.environment == "production"
+
+    @property
+    def allowed_host_values(self) -> list[str]:
+        """Host header allowlist for FastMCP's DNS-rebinding protection.
+
+        Localhost variants cover local dev. The deployment host is derived from
+        JARVIES_PUBLIC_URL first, then AZURE_REDIRECT_URI — one of which is
+        already configured to the public domain in every real deployment, so the
+        live host is allowed without a separate env var. MCP_ALLOWED_HOSTS adds
+        any extras explicitly.
+        """
+
+        hosts = ["localhost", "localhost:*", "127.0.0.1", "127.0.0.1:*"]
+        for source in (self.public_base_url, self.azure_redirect_uri):
+            netloc = urlsplit(source).netloc if source else ""
+            if netloc:
+                hosts.append(netloc)
+        hosts.extend(part.strip() for part in self.allowed_hosts.split(",") if part.strip())
+
+        seen: set[str] = set()
+        ordered: list[str] = []
+        for host in hosts:
+            if host not in seen:
+                seen.add(host)
+                ordered.append(host)
+        return ordered
+
+    @property
+    def allowed_origin_values(self) -> list[str]:
+        """Origin header allowlist mirroring the host allowlist.
+
+        FastMCP also validates Origin (403 on mismatch). Non-localhost hosts are
+        offered as https origins; localhost gets an http origin for dev tools.
+        Requests without an Origin header (typical server-to-server MCP clients)
+        are always allowed by FastMCP regardless of this list.
+        """
+
+        origins: list[str] = []
+        for host in self.allowed_host_values:
+            scheme = "http" if host.startswith(("localhost", "127.0.0.1")) else "https"
+            origins.append(f"{scheme}://{host}")
+        return origins
 
     @property
     def api_key_values(self) -> set[str]:
