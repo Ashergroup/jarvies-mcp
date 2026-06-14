@@ -13,6 +13,8 @@ dependencies = [
   "PyJWT[crypto]>=2.8.0",
   "asyncpg>=0.29.0",
   "anyio>=4.3.0",
+  "msal>=1.28.0",
+  "python-jose[cryptography]>=3.3.0",
 ]
 
 [project.optional-dependencies]

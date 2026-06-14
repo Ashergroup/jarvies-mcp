@@ -23,10 +23,12 @@ from typing import Any
 from starlette.types import ASGIApp, Receive, Scope, Send
 
 from agents.mcp.database import DatabaseNotConfiguredError, get_conn
+from agents.mcp.oauth import decode_jarvies_token
 
 log = logging.getLogger(__name__)
 
 TENANT_HEADER = b"x-tenant-id"
+AUTH_HEADER = b"authorization"
 
 _current_tenant: ContextVar[dict[str, Any] | None] = ContextVar(
     "mcp_current_tenant",
@@ -155,11 +157,21 @@ class TenantResolutionMiddleware:
             return
 
         tenant: dict[str, Any] | None = None
-        tenant_id = _header_value(scope, TENANT_HEADER)
-        if tenant_id:
-            tenant = await load_tenant(tenant_id)
-            if tenant is None:
-                log.warning("tenant_header_unresolved", extra={"tenant_id": tenant_id})
+
+        # 1. Jarvies OAuth bearer token — the tenant_id claim is authoritative.
+        auth_header = _header_value(scope, AUTH_HEADER)
+        if auth_header and auth_header.lower().startswith("bearer "):
+            claims = decode_jarvies_token(auth_header.split(" ", 1)[1].strip())
+            if claims and claims.get("tenant_id"):
+                tenant = await load_tenant(claims["tenant_id"])
+
+        # 2. Fall back to the explicit X-Tenant-ID header (Phase 2A test path).
+        if tenant is None:
+            tenant_id = _header_value(scope, TENANT_HEADER)
+            if tenant_id:
+                tenant = await load_tenant(tenant_id)
+                if tenant is None:
+                    log.warning("tenant_header_unresolved", extra={"tenant_id": tenant_id})
 
         # Starlette's Request.state reads from scope["state"]; populate it so
         # request.state.tenant works for any FastAPI/Starlette route.

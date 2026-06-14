@@ -52,6 +52,21 @@ class MCPSettings(BaseSettings):
     jwt_audience: str = Field(default="", validation_alias="MCP_JWT_AUDIENCE")
     jwt_issuer: str = Field(default="", validation_alias="MCP_JWT_ISSUER")
 
+    # Azure AD (Phase 2B OAuth). Multi-tenant app on the /common endpoint.
+    azure_client_id: str = Field(default="", validation_alias="AZURE_CLIENT_ID")
+    azure_client_secret: str = Field(default="", validation_alias="AZURE_CLIENT_SECRET")
+    azure_tenant_id: str = Field(default="", validation_alias="AZURE_TENANT_ID")
+    azure_redirect_uri: str = Field(default="", validation_alias="AZURE_REDIRECT_URI")
+    azure_authority: str = Field(
+        default="https://login.microsoftonline.com/common",
+        validation_alias="AZURE_AUTHORITY",
+    )
+    # Secret used to sign Jarvies-issued access tokens (HS256).
+    jarvies_token_secret: str = Field(default="", validation_alias="JARVIES_TOKEN_SECRET")
+    # Optional override for the OAuth issuer / discovery base URL. When empty the
+    # URL is derived from the incoming request.
+    public_base_url: str = Field(default="", validation_alias="JARVIES_PUBLIC_URL")
+
     default_tenant_id: str = Field(default="local", validation_alias="MCP_DEFAULT_TENANT_ID")
     default_user_id: str = Field(default="local-user", validation_alias="MCP_DEFAULT_USER_ID")
     default_permissions: str = Field(default="", validation_alias="MCP_DEFAULT_PERMISSIONS")

@@ -14,6 +14,7 @@ from starlette.requests import Request
 from starlette.responses import JSONResponse, Response
 
 from agents.mcp.config import get_settings
+from agents.mcp.oauth import OAUTH_PUBLIC_PATHS, decode_jarvies_token
 
 try:  # PyJWT is optional until JWT auth is enabled.
     import jwt
@@ -23,7 +24,7 @@ except Exception:  # pragma: no cover - exercised only when dependency is absent
 log = logging.getLogger(__name__)
 
 
-PUBLIC_PATHS = {"/health", "/"}
+PUBLIC_PATHS = {"/health", "/"} | OAUTH_PUBLIC_PATHS
 
 
 def log_production_safety_warnings() -> None:
@@ -87,11 +88,21 @@ class MCPAuthMiddleware(BaseHTTPMiddleware):
             return await call_next(request)
 
         bearer = _bearer_token(request)
+        # Jarvies-issued OAuth access token (Phase 2B). Tenant resolution from
+        # its tenant_id claim happens in TenantResolutionMiddleware.
+        if bearer and decode_jarvies_token(bearer) is not None:
+            request.state.auth_method = "jarvies_token"
+            return await call_next(request)
+
         if bearer and _jwt_allowed(bearer):
             request.state.auth_method = "jwt"
             return await call_next(request)
 
-        if not settings.api_key_values and not settings.jwt_secret:
+        if (
+            not settings.api_key_values
+            and not settings.jwt_secret
+            and not settings.jarvies_token_secret
+        ):
             status_code = 503 if settings.is_production else 401
             return JSONResponse(
                 {

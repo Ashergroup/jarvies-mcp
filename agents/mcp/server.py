@@ -14,6 +14,7 @@ from starlette.responses import JSONResponse
 from agents.mcp.auth import MCPAuthMiddleware, log_production_safety_warnings
 from agents.mcp.config import get_settings
 from agents.mcp.database import close_pool, init_pool
+from agents.mcp.oauth import register_oauth_routes
 from agents.mcp.tenant import TenantResolutionMiddleware
 from agents.mcp.tool_registry import register_all_tools
 
@@ -99,4 +100,10 @@ async def health(_: Any) -> JSONResponse:
 
 
 app.add_route("/health", health, methods=["GET"])
+
+# OAuth 2.0 authorization-server endpoints (Phase 2B). These paths are public
+# (listed in auth.PUBLIC_PATHS) so the discovery/flow can run before a token
+# exists.
+register_oauth_routes(app)
+
 log.info("mcp_server_ready", extra={"endpoint": "/mcp"})
