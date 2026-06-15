@@ -32,6 +32,13 @@ TOOL_POLICIES: dict[str, ToolPolicy] = {
     "m365_search_sharepoint": ToolPolicy(required_any={"m365_access"}),
     "m365_search_calendar": ToolPolicy(required_any={"m365_access"}),
     "m365_create_email_draft": ToolPolicy(required_any={"m365_access"}, write=True),
+    "m365_send_email": ToolPolicy(required_any={"m365_access"}, write=True),
+    "m365_create_calendar_event": ToolPolicy(required_any={"m365_access"}, write=True),
+    "m365_upload_to_sharepoint": ToolPolicy(required_any={"m365_access"}, write=True),
+    "m365_create_sharepoint_folder": ToolPolicy(
+        required_any={"m365_access"}, write=True
+    ),
+    "m365_post_teams_message": ToolPolicy(required_any={"m365_access"}, write=True),
     "xero_get_contacts": ToolPolicy(required_any={"finance_access"}),
     "xero_get_invoices": ToolPolicy(required_any={"finance_access"}),
     "xero_get_payments": ToolPolicy(required_any={"finance_access"}),

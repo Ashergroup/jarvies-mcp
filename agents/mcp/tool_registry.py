@@ -12,6 +12,7 @@ from agents.mcp.tools import (
     finance_tools,
     freshsales_tools,
     m365_tools,
+    m365_write_tools,
     powerbi_tools,
     xero_tools,
 )
@@ -24,6 +25,7 @@ def register_all_tools(mcp: Any) -> None:
 
     for module in (
         m365_tools,
+        m365_write_tools,
         xero_tools,
         cin7_tools,
         freshsales_tools,
