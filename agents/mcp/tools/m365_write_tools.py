@@ -3,9 +3,9 @@
 These tools do NOT wrap the Zola M365 agent. They call Microsoft Graph
 (`https://graph.microsoft.com/v1.0`) directly using the per-request user
 OAuth token supplied via `access_token` — the same pattern every other
-Jarvies tool uses. The existing read tools in `m365_tools.py` continue to
-wrap Zola and are deliberately left untouched. Zola will later be rewired to
-call Jarvies for these operations.
+Jarvies tool uses. The read tools in `m365_tools.py` call Graph directly too
+and share the helpers in this module. Zola will later be rewired to call
+Jarvies for these operations.
 
 Auth: each tool needs the signed-in user's delegated Graph access token
 passed as `access_token`. The Azure AD app registration must have the

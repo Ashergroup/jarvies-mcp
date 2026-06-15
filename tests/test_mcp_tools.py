@@ -1,12 +1,13 @@
 from __future__ import annotations
 
-from contextlib import contextmanager
-from types import SimpleNamespace
-
+import httpx
 import pytest
+import respx
 
 from agents.mcp.permissions import MCPPermissionError, check_permission
 from agents.mcp.tools import db_tools, m365_tools, xero_tools
+
+GRAPH = "https://graph.microsoft.com/v1.0"
 
 
 def test_permission_allows_m365_read() -> None:
@@ -45,37 +46,60 @@ def test_database_validation_allows_select() -> None:
 
 
 @pytest.mark.asyncio
-async def test_m365_search_emails_wraps_existing_tool(monkeypatch: pytest.MonkeyPatch) -> None:
-    calls = {}
+async def test_m365_search_emails_calls_graph_directly() -> None:
+    with respx.mock(assert_all_called=True) as mock:
+        route = mock.get(f"{GRAPH}/me/messages").mock(
+            return_value=httpx.Response(
+                200,
+                json={
+                    "value": [
+                        {
+                            "id": "msg-1",
+                            "subject": "Board pack",
+                            "from": {"emailAddress": {"address": "cfo@nichegroup.africa"}},
+                            "receivedDateTime": "2026-06-01T09:00:00Z",
+                            "isRead": False,
+                            "hasAttachments": True,
+                            "bodyPreview": "<p>draft attached</p>",
+                            "importance": "high",
+                        }
+                    ]
+                },
+            )
+        )
+        result = await m365_tools.m365_search_emails(
+            query="board",
+            limit=5,
+            tenant_id="tenant-a",
+            user_id="user-a",
+            access_token="token-123",
+            permissions=["m365_access"],
+        )
 
-    def fake_search_emails(**kwargs):
-        calls.update(kwargs)
-        return [{"subject": "Board pack"}]
+    assert result["status"] == "ok"
+    assert result["source"] == "m365"
+    assert result["data"]["count"] == 1
+    assert result["data"]["emails"][0]["subject"] == "Board pack"
+    assert result["data"]["emails"][0]["uri"] == "mail:///messages/msg-1"
+    request = route.calls[0].request
+    assert request.headers["Authorization"] == "Bearer token-123"
+    assert request.url.params["$search"] == '"board"'
 
-    @contextmanager
-    def fake_scope(access_token, write_tools=None):
-        assert access_token == "token-123"
-        yield
 
-    monkeypatch.setattr(
-        m365_tools,
-        "_load_read_tools",
-        lambda: SimpleNamespace(search_emails=fake_search_emails),
-    )
-    monkeypatch.setattr(m365_tools, "_m365_call_scope", fake_scope)
+@pytest.mark.asyncio
+async def test_m365_search_emails_error_on_403() -> None:
+    with respx.mock(assert_all_called=True) as mock:
+        mock.get(f"{GRAPH}/me/messages").mock(
+            return_value=httpx.Response(403, json={"error": "forbidden"})
+        )
+        result = await m365_tools.m365_search_emails(
+            query="board",
+            access_token="token-123",
+            permissions=["m365_access"],
+        )
 
-    result = await m365_tools.m365_search_emails(
-        query="board",
-        limit=5,
-        tenant_id="tenant-a",
-        user_id="user-a",
-        access_token="token-123",
-        permissions=["m365_access"],
-    )
-
-    assert result == [{"subject": "Board pack"}]
-    assert calls["query"] == "board"
-    assert calls["limit"] == 5
+    assert result["status"] == "error"
+    assert "403" in (result["error"] or "")
 
 
 @pytest.mark.asyncio
