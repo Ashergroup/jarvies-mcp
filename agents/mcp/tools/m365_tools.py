@@ -29,8 +29,10 @@ from agents.mcp.config import get_settings
 from agents.mcp.permissions import check_permission
 from agents.mcp.tenant_context import use_tenant_context
 from agents.mcp.tools.m365_write_tools import (
+    _NO_TOKEN_MESSAGE,
     _context,
     _err,
+    _get_m365_token,
     _graph_request,
     _ok,
 )
@@ -115,9 +117,11 @@ async def m365_search_emails(
         check_permission(
             context.tenant_id, context.user_id, "m365_search_emails", context.permissions
         )
-        token = context.access_token
+        token = await _get_m365_token(
+            context.access_token, context.user_id, context.tenant_id
+        )
         if not token:
-            return _err("No access_token supplied for the Microsoft Graph call")
+            return _err(_NO_TOKEN_MESSAGE)
 
         size = _limit(limit)
         params: dict[str, Any] = {
@@ -185,9 +189,11 @@ async def m365_read_email(
         check_permission(
             context.tenant_id, context.user_id, "m365_read_email", context.permissions
         )
-        token = context.access_token
+        token = await _get_m365_token(
+            context.access_token, context.user_id, context.tenant_id
+        )
         if not token:
-            return _err("No access_token supplied for the Microsoft Graph call")
+            return _err(_NO_TOKEN_MESSAGE)
         if not uri.startswith("mail:///messages/"):
             return _err(f"Not an email URI: {uri}")
         msg_id = uri.removeprefix("mail:///messages/")
@@ -249,9 +255,11 @@ async def m365_search_calendar(
         check_permission(
             context.tenant_id, context.user_id, "m365_search_calendar", context.permissions
         )
-        token = context.access_token
+        token = await _get_m365_token(
+            context.access_token, context.user_id, context.tenant_id
+        )
         if not token:
-            return _err("No access_token supplied for the Microsoft Graph call")
+            return _err(_NO_TOKEN_MESSAGE)
 
         size = _limit(limit)
         params: dict[str, Any] = {
@@ -320,9 +328,11 @@ async def m365_search_sharepoint(
         check_permission(
             context.tenant_id, context.user_id, "m365_search_sharepoint", context.permissions
         )
-        token = context.access_token
+        token = await _get_m365_token(
+            context.access_token, context.user_id, context.tenant_id
+        )
         if not token:
-            return _err("No access_token supplied for the Microsoft Graph call")
+            return _err(_NO_TOKEN_MESSAGE)
 
         size = _limit(limit)
         payload = {
@@ -404,9 +414,11 @@ async def m365_create_email_draft(
         check_permission(
             context.tenant_id, context.user_id, "m365_create_email_draft", context.permissions
         )
-        token = context.access_token
+        token = await _get_m365_token(
+            context.access_token, context.user_id, context.tenant_id
+        )
         if not token:
-            return _err("No access_token supplied for the Microsoft Graph call")
+            return _err(_NO_TOKEN_MESSAGE)
         if not isinstance(to, list) or not to:
             return _err("to must be a non-empty list of email addresses")
 

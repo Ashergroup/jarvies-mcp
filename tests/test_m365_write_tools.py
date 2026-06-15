@@ -7,11 +7,13 @@ import pytest
 import respx
 
 from agents.mcp import config as mcp_config
-from agents.mcp.tools import m365_write_tools
+from agents.mcp import tenant as mcp_tenant
+from agents.mcp.tools import m365_tools, m365_write_tools
 
 GRAPH = "https://graph.microsoft.com/v1.0"
 PERMS = ["m365_access"]
 TOKEN = "fake-graph-token-do-not-log"
+REAL_USER_ID = "22222222-2222-2222-2222-222222222222"
 
 
 @pytest.fixture(autouse=True)
@@ -288,6 +290,7 @@ async def test_post_teams_message_chat_error_on_403() -> None:
 
 @pytest.mark.asyncio
 async def test_missing_access_token_returns_error() -> None:
+    # No explicit token, no user_id, no auth context → no token resolvable.
     result = await m365_write_tools.m365_send_email(
         to=["a@nichegroup.africa"],
         subject="x",
@@ -295,7 +298,100 @@ async def test_missing_access_token_returns_error() -> None:
         permissions=PERMS,
     )
     assert result["status"] == "error"
-    assert "access_token" in (result["error"] or "")
+    assert result["error"] == "No M365 access token available — please reconnect via OAuth"
+
+
+# ---------------------------------------------------------------------------
+# _get_m365_token helper — token resolution priority
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_get_m365_token_prefers_explicit_token() -> None:
+    # Explicit token wins and no DB lookup is attempted.
+    result = await m365_write_tools._get_m365_token("explicit-tok", REAL_USER_ID, "t")
+    assert result == "explicit-tok"
+
+
+@pytest.mark.asyncio
+async def test_get_m365_token_falls_back_to_stored(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    async def fake_lookup(user_id: str) -> str:
+        assert user_id == REAL_USER_ID
+        return "stored-tok"
+
+    monkeypatch.setattr(m365_write_tools, "_lookup_user_token", fake_lookup)
+    result = await m365_write_tools._get_m365_token(None, REAL_USER_ID, "t")
+    assert result == "stored-tok"
+
+
+@pytest.mark.asyncio
+async def test_get_m365_token_uses_authenticated_context(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    async def fake_lookup(user_id: str) -> str:
+        assert user_id == REAL_USER_ID
+        return "ctx-tok"
+
+    monkeypatch.setattr(m365_write_tools, "_lookup_user_token", fake_lookup)
+    # No explicit token; user_id arg is the default placeholder, but the
+    # bearer-token identity is published on the context var.
+    token = mcp_tenant.set_current_user_id(REAL_USER_ID)
+    try:
+        result = await m365_write_tools._get_m365_token(None, "local-user", None)
+    finally:
+        mcp_tenant.reset_current_user_id(token)
+    assert result == "ctx-tok"
+
+
+@pytest.mark.asyncio
+async def test_get_m365_token_none_when_no_identity() -> None:
+    # Default placeholder user_id and no context → no DB hit, no token.
+    result = await m365_write_tools._get_m365_token(None, "local-user", None)
+    assert result is None
+
+
+@pytest.mark.asyncio
+async def test_send_email_uses_stored_token(monkeypatch: pytest.MonkeyPatch) -> None:
+    async def fake_lookup(user_id: str) -> str:
+        return "stored-graph-token"
+
+    monkeypatch.setattr(m365_write_tools, "_lookup_user_token", fake_lookup)
+    with respx.mock(assert_all_called=True) as mock:
+        route = mock.post(f"{GRAPH}/me/sendMail").mock(
+            return_value=httpx.Response(202)
+        )
+        result = await m365_write_tools.m365_send_email(
+            to=["a@nichegroup.africa"],
+            subject="Hi",
+            body="Body",
+            user_id=REAL_USER_ID,
+            permissions=PERMS,
+        )
+
+    assert result["status"] == "ok"
+    assert route.calls[0].request.headers["Authorization"] == "Bearer stored-graph-token"
+
+
+@pytest.mark.asyncio
+async def test_read_tool_uses_stored_token(monkeypatch: pytest.MonkeyPatch) -> None:
+    async def fake_lookup(user_id: str) -> str:
+        return "stored-graph-token"
+
+    monkeypatch.setattr(m365_write_tools, "_lookup_user_token", fake_lookup)
+    with respx.mock(assert_all_called=True) as mock:
+        route = mock.get(f"{GRAPH}/me/messages").mock(
+            return_value=httpx.Response(200, json={"value": []})
+        )
+        result = await m365_tools.m365_search_emails(
+            query="board",
+            user_id=REAL_USER_ID,
+            permissions=PERMS,
+        )
+
+    assert result["status"] == "ok"
+    assert route.calls[0].request.headers["Authorization"] == "Bearer stored-graph-token"
 
 
 @pytest.mark.asyncio

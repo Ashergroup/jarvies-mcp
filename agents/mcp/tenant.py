@@ -35,6 +35,11 @@ _current_tenant: ContextVar[dict[str, Any] | None] = ContextVar(
     default=None,
 )
 
+_current_user_id: ContextVar[str | None] = ContextVar(
+    "mcp_current_user_id",
+    default=None,
+)
+
 
 def current_tenant() -> dict[str, Any] | None:
     """Return the tenant resolved for the current request/tool call, if any."""
@@ -52,6 +57,29 @@ def reset_current_tenant(token: Any) -> None:
     """Restore a previous tenant context using the token from ``set_current_tenant``."""
 
     _current_tenant.reset(token)
+
+
+def current_user_id() -> str | None:
+    """Return the authenticated user id (the bearer token ``sub``) for this call.
+
+    Set from the Jarvies access token by ``TenantResolutionMiddleware``. ``None``
+    when no bearer token resolved (e.g. the X-API-Key / local path). Lets tool
+    code retrieve per-user stored credentials without the HTTP request object.
+    """
+
+    return _current_user_id.get()
+
+
+def set_current_user_id(user_id: str | None) -> Any:
+    """Set the current user id; returns the reset token (for symmetry in tests)."""
+
+    return _current_user_id.set(user_id)
+
+
+def reset_current_user_id(token: Any) -> None:
+    """Restore a previous user-id context using the token from ``set_current_user_id``."""
+
+    _current_user_id.reset(token)
 
 
 async def load_tenant(tenant_id: str) -> dict[str, Any] | None:
@@ -157,13 +185,16 @@ class TenantResolutionMiddleware:
             return
 
         tenant: dict[str, Any] | None = None
+        user_id: str | None = None
 
         # 1. Jarvies OAuth bearer token — the tenant_id claim is authoritative.
         auth_header = _header_value(scope, AUTH_HEADER)
         if auth_header and auth_header.lower().startswith("bearer "):
             claims = decode_jarvies_token(auth_header.split(" ", 1)[1].strip())
-            if claims and claims.get("tenant_id"):
-                tenant = await load_tenant(claims["tenant_id"])
+            if claims:
+                user_id = claims.get("sub")
+                if claims.get("tenant_id"):
+                    tenant = await load_tenant(claims["tenant_id"])
 
         # 2. Fall back to the explicit X-Tenant-ID header (Phase 2A test path).
         if tenant is None:
@@ -179,7 +210,9 @@ class TenantResolutionMiddleware:
         state["tenant"] = tenant
 
         token = set_current_tenant(tenant)
+        user_token = set_current_user_id(user_id)
         try:
             await self.app(scope, receive, send)
         finally:
+            reset_current_user_id(user_token)
             reset_current_tenant(token)

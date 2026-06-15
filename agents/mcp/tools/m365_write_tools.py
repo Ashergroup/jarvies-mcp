@@ -35,12 +35,17 @@ from typing import Any
 import httpx
 
 from agents.mcp.config import get_settings
+from agents.mcp.database import get_conn
 from agents.mcp.permissions import check_permission
+from agents.mcp.tenant import current_user_id
 from agents.mcp.tenant_context import build_tenant_context, use_tenant_context
 
 log = logging.getLogger(__name__)
 
 GRAPH_BASE = "https://graph.microsoft.com/v1.0"
+
+# Returned when no Microsoft access token can be resolved for a tool call.
+_NO_TOKEN_MESSAGE = "No M365 access token available — please reconnect via OAuth"
 
 
 def _ok(data: dict[str, Any]) -> dict[str, Any]:
@@ -67,6 +72,60 @@ def _context(
         access_token=access_token,
         permissions=permissions,
     )
+
+
+async def _lookup_user_token(user_id: str) -> str | None:
+    """Return the stored Microsoft access token for a user, or None.
+
+    Reads the row persisted at OAuth-callback time (see
+    ``agents.mcp.oauth._persist_identity``) from ``user_tokens``. Never raises:
+    a missing or unreachable database degrades to None so the caller surfaces
+    the standard reconnect error.
+    """
+
+    try:
+        async with get_conn() as conn:
+            row = await conn.fetchrow(
+                "SELECT access_token FROM user_tokens "
+                "WHERE user_id::text = $1 ORDER BY updated_at DESC LIMIT 1",
+                user_id,
+            )
+    except Exception:
+        log.warning("m365_token_lookup_failed")
+        return None
+    if row is None:
+        return None
+    return row["access_token"] or None
+
+
+async def _get_m365_token(
+    access_token: str | None,
+    user_id: str | None,
+    tenant_id: str | None,
+) -> str | None:
+    """Resolve the Microsoft access token for an M365 tool call.
+
+    Priority:
+      1. An explicitly supplied ``access_token`` (backward compatible — the
+         existing test/Claude-Desktop path).
+      2. The token stored for the authenticated user at OAuth-callback time.
+         The user is taken from the request's bearer-token identity
+         (``tenant.current_user_id``), or an explicit non-default ``user_id``.
+
+    Returns None when neither is available; callers then return
+    ``_NO_TOKEN_MESSAGE``. ``tenant_id`` is accepted for call-site symmetry.
+    """
+
+    if access_token:
+        return access_token
+
+    effective_user_id = current_user_id()
+    if not effective_user_id and user_id and user_id != get_settings().default_user_id:
+        effective_user_id = user_id
+    if not effective_user_id:
+        return None
+
+    return await _lookup_user_token(effective_user_id)
 
 
 async def _graph_request(
@@ -189,9 +248,11 @@ async def m365_send_email(
         check_permission(
             context.tenant_id, context.user_id, "m365_send_email", context.permissions
         )
-        token = context.access_token
+        token = await _get_m365_token(
+            context.access_token, context.user_id, context.tenant_id
+        )
         if not token:
-            return _err("No access_token supplied for the Microsoft Graph call")
+            return _err(_NO_TOKEN_MESSAGE)
         if not isinstance(to, list) or not to:
             return _err("to must be a non-empty list of email addresses")
 
@@ -257,9 +318,11 @@ async def m365_create_calendar_event(
             "m365_create_calendar_event",
             context.permissions,
         )
-        token = context.access_token
+        token = await _get_m365_token(
+            context.access_token, context.user_id, context.tenant_id
+        )
         if not token:
-            return _err("No access_token supplied for the Microsoft Graph call")
+            return _err(_NO_TOKEN_MESSAGE)
 
         event: dict[str, Any] = {
             "subject": subject,
@@ -330,9 +393,11 @@ async def m365_upload_to_sharepoint(
             "m365_upload_to_sharepoint",
             context.permissions,
         )
-        token = context.access_token
+        token = await _get_m365_token(
+            context.access_token, context.user_id, context.tenant_id
+        )
         if not token:
-            return _err("No access_token supplied for the Microsoft Graph call")
+            return _err(_NO_TOKEN_MESSAGE)
 
         name = file_name or os.path.basename(file_path)
         if not name:
@@ -401,9 +466,11 @@ async def m365_create_sharepoint_folder(
             "m365_create_sharepoint_folder",
             context.permissions,
         )
-        token = context.access_token
+        token = await _get_m365_token(
+            context.access_token, context.user_id, context.tenant_id
+        )
         if not token:
-            return _err("No access_token supplied for the Microsoft Graph call")
+            return _err(_NO_TOKEN_MESSAGE)
 
         try:
             drive_id, parent_id = await _resolve_drive_item(parent_folder_url, token)
@@ -473,9 +540,11 @@ async def m365_post_teams_message(
             "m365_post_teams_message",
             context.permissions,
         )
-        token = context.access_token
+        token = await _get_m365_token(
+            context.access_token, context.user_id, context.tenant_id
+        )
         if not token:
-            return _err("No access_token supplied for the Microsoft Graph call")
+            return _err(_NO_TOKEN_MESSAGE)
 
         payload: dict[str, Any] = {"body": {"contentType": "html", "content": message}}
         if "/" in channel_or_chat_id:
