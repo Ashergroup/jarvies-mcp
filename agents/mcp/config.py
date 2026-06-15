@@ -53,6 +53,10 @@ class MCPSettings(BaseSettings):
     jwt_audience: str = Field(default="", validation_alias="MCP_JWT_AUDIENCE")
     jwt_issuer: str = Field(default="", validation_alias="MCP_JWT_ISSUER")
 
+    # Dedicated key for the /admin tenant-credential endpoints (NOT MCP_API_KEYS).
+    # Empty disables admin access entirely: every /admin request returns 401.
+    admin_api_key: str = Field(default="", validation_alias="JARVIES_ADMIN_API_KEY")
+
     # Azure AD (Phase 2B OAuth). Multi-tenant app on the /common endpoint.
     azure_client_id: str = Field(default="", validation_alias="AZURE_CLIENT_ID")
     azure_client_secret: str = Field(default="", validation_alias="AZURE_CLIENT_SECRET")

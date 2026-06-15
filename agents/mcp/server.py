@@ -13,6 +13,7 @@ from mcp.server.transport_security import TransportSecuritySettings
 from starlette.responses import JSONResponse
 from starlette.routing import Route
 
+from agents.mcp.admin import register_admin_routes
 from agents.mcp.auth import MCPAuthMiddleware, log_production_safety_warnings
 from agents.mcp.config import get_settings
 from agents.mcp.database import close_pool, init_pool
@@ -148,5 +149,9 @@ app.add_route("/health", health, methods=["GET"])
 # (listed in auth.PUBLIC_PATHS) so the discovery/flow can run before a token
 # exists.
 register_oauth_routes(app)
+
+# Admin tenant-credential endpoints (/admin/*). These enforce their own
+# X-API-Key (JARVIES_ADMIN_API_KEY) and are skipped by MCPAuthMiddleware.
+register_admin_routes(app)
 
 log.info("mcp_server_ready", extra={"endpoint": "/mcp"})

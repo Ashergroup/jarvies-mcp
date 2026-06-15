@@ -82,6 +82,12 @@ class MCPAuthMiddleware(BaseHTTPMiddleware):
         if path in PUBLIC_PATHS or request.method == "OPTIONS":
             return await call_next(request)
 
+        # /admin/* carries its own X-API-Key (JARVIES_ADMIN_API_KEY), enforced in
+        # the admin route handlers, so the MCP bearer/JWT auth layer must not gate
+        # it. The handlers return 401 themselves when the key is missing or wrong.
+        if path == "/admin" or path.startswith("/admin/"):
+            return await call_next(request)
+
         if settings.allow_unauthenticated and not settings.is_production:
             log.warning("mcp_auth_bypassed_non_production", extra={"path": request.url.path})
             return await call_next(request)
