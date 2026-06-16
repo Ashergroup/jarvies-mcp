@@ -16,6 +16,7 @@ from typing import Any
 import httpx
 
 from agents.mcp.config import MCPSettings, get_settings
+from agents.mcp.credentials import resolve_settings
 from agents.mcp.integrations import error as integration_error
 from agents.mcp.integrations import not_configured, ok
 from agents.mcp.permissions import check_permission
@@ -276,7 +277,7 @@ async def freshsales_get_contacts(
             "freshsales_get_contacts",
             context.permissions,
         )
-        settings = get_settings()
+        settings = (await resolve_settings("freshsales")).settings
         if not settings.freshsales_configured:
             return not_configured(
                 "freshsales", "FRESHSALES_DOMAIN/FRESHSALES_API_KEY are not configured."
@@ -320,7 +321,7 @@ async def freshsales_get_accounts(
             "freshsales_get_accounts",
             context.permissions,
         )
-        settings = get_settings()
+        settings = (await resolve_settings("freshsales")).settings
         if not settings.freshsales_configured:
             return not_configured(
                 "freshsales", "FRESHSALES_DOMAIN/FRESHSALES_API_KEY are not configured."
@@ -369,7 +370,7 @@ async def freshsales_get_deals(
             "freshsales_get_deals",
             context.permissions,
         )
-        settings = get_settings()
+        settings = (await resolve_settings("freshsales")).settings
         if not settings.freshsales_configured:
             return not_configured(
                 "freshsales", "FRESHSALES_DOMAIN/FRESHSALES_API_KEY are not configured."
@@ -421,7 +422,7 @@ async def freshsales_search(
             "freshsales_search",
             context.permissions,
         )
-        settings = get_settings()
+        settings = (await resolve_settings("freshsales")).settings
         if not settings.freshsales_configured:
             return not_configured(
                 "freshsales", "FRESHSALES_DOMAIN/FRESHSALES_API_KEY are not configured."

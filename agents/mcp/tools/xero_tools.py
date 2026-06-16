@@ -40,9 +40,11 @@ from typing import Any
 import httpx
 
 from agents.mcp.config import MCPSettings, get_settings
+from agents.mcp.credentials import resolve_settings
 from agents.mcp.integrations import error as integration_error
 from agents.mcp.integrations import not_configured, ok
 from agents.mcp.permissions import check_permission
+from agents.mcp.tenant import current_tenant
 from agents.mcp.tenant_context import build_tenant_context, use_tenant_context
 
 log = logging.getLogger(__name__)
@@ -116,14 +118,27 @@ class XeroService:
     lifetime of the service).
     """
 
-    def __init__(self, settings: MCPSettings | None = None) -> None:
+    def __init__(
+        self,
+        settings: MCPSettings | None = None,
+        *,
+        use_persisted_refresh_token: bool = True,
+    ) -> None:
         self._settings = settings or get_settings()
         self._client: httpx.AsyncClient | None = None
         self._tokens: dict[str, _CachedToken] = {}
-        # File on disk wins over env so we never use a stale .env value after
-        # the very first rotation.
-        persisted = _read_persisted_refresh_token()
-        self._refresh_token: str = persisted or self._settings.xero_refresh_token
+        # The on-disk rotation file belongs to the env/singleton (Asher) path.
+        # Per-tenant services built from DB credentials pass
+        # use_persisted_refresh_token=False so tenants never read or overwrite
+        # each other's token via that shared file.
+        self._use_persisted_refresh_token = use_persisted_refresh_token
+        if use_persisted_refresh_token:
+            # File on disk wins over env so we never use a stale .env value after
+            # the very first rotation.
+            persisted = _read_persisted_refresh_token()
+            self._refresh_token: str = persisted or self._settings.xero_refresh_token
+        else:
+            self._refresh_token = self._settings.xero_refresh_token
 
     async def _http(self) -> httpx.AsyncClient:
         if self._client is None:
@@ -185,24 +200,29 @@ class XeroService:
 
         new_refresh = payload.get("refresh_token")
         if new_refresh and new_refresh != self._refresh_token:
-            try:
-                _write_persisted_refresh_token(new_refresh)
-                self._refresh_token = new_refresh
-                log.warning(
-                    "Xero rotated refresh token; new value persisted to %s",
-                    _refresh_token_path(),
-                )
-            except OSError as exc:
-                # If persistence fails we still update in-memory state so the
-                # next call in this process uses the new value, but we surface
-                # a clear warning. We DO NOT log the token itself.
-                self._refresh_token = new_refresh
-                log.warning(
-                    "Xero rotated refresh token but persistence to %s failed (%s); "
-                    "token kept in memory only — restart will lose it",
-                    _refresh_token_path(),
-                    exc.__class__.__name__,
-                )
+            self._refresh_token = new_refresh
+            if not self._use_persisted_refresh_token:
+                # Per-tenant (DB-sourced) service: never touch the shared on-disk
+                # file. The rotated token lives only for this call; persisting it
+                # back to the tenant's DB row is a separate follow-up.
+                log.warning("Xero rotated refresh token for a per-tenant service")
+            else:
+                try:
+                    _write_persisted_refresh_token(new_refresh)
+                    log.warning(
+                        "Xero rotated refresh token; new value persisted to %s",
+                        _refresh_token_path(),
+                    )
+                except OSError as exc:
+                    # If persistence fails we still keep the new in-memory value so
+                    # the next call in this process uses it, but we surface a clear
+                    # warning. We DO NOT log the token itself.
+                    log.warning(
+                        "Xero rotated refresh token but persistence to %s failed (%s); "
+                        "token kept in memory only — restart will lose it",
+                        _refresh_token_path(),
+                        exc.__class__.__name__,
+                    )
 
         self._tokens[tenant_id] = _CachedToken(access_token, now + expires_in)
         return access_token
@@ -409,6 +429,31 @@ async def _reset_service() -> None:
         _service = None
 
 
+async def _acquire_service() -> tuple[XeroService, bool] | None:
+    """Return ``(service, owned)`` for this call, or ``None`` when not configured.
+
+    Credential source (shared resolver in ``agents.mcp.credentials``):
+      - No tenant resolved, or a tenant with no DB Xero row → env credentials via
+        the process-wide singleton (preserves the access-token cache and the
+        on-disk refresh-token rotation — i.e. the existing Asher Group path).
+      - A tenant whose ``tenant_credentials`` row supplies Xero creds → a
+        per-call service built from those DB credentials. ``owned=True`` means
+        the caller must ``aclose()`` it.
+    """
+
+    if current_tenant() is None:
+        if not get_settings().xero_configured:
+            return None
+        return _get_service(), False
+
+    resolved = await resolve_settings("xero")
+    if not resolved.settings.xero_configured:
+        return None
+    if resolved.from_db:
+        return XeroService(resolved.settings, use_persisted_refresh_token=False), True
+    return _get_service(), False
+
+
 def _resolve_page_size(value: int | None, settings: MCPSettings) -> int:
     if value is None:
         return settings.tool_result_limit
@@ -474,10 +519,15 @@ async def xero_get_contacts(
             "xero_get_contacts",
             context.permissions,
         )
-        settings = get_settings()
-        if not settings.xero_configured:
+        acquired = await _acquire_service()
+        if acquired is None:
             return not_configured("xero", _NOT_CONFIGURED_MESSAGE)
-        return await _call(_get_service().get_contacts(page=page, page_size=page_size))
+        service, owned = acquired
+        try:
+            return await _call(service.get_contacts(page=page, page_size=page_size))
+        finally:
+            if owned:
+                await service.aclose()
 
 
 async def xero_get_invoices(
@@ -514,19 +564,24 @@ async def xero_get_invoices(
             "xero_get_invoices",
             context.permissions,
         )
-        settings = get_settings()
-        if not settings.xero_configured:
+        acquired = await _acquire_service()
+        if acquired is None:
             return not_configured("xero", _NOT_CONFIGURED_MESSAGE)
-        return await _call(
-            _get_service().get_invoices(
-                status=status,
-                date_from=date_from,
-                date_to=date_to,
-                contact_id=contact_id,
-                page=page,
-                page_size=page_size,
+        service, owned = acquired
+        try:
+            return await _call(
+                service.get_invoices(
+                    status=status,
+                    date_from=date_from,
+                    date_to=date_to,
+                    contact_id=contact_id,
+                    page=page,
+                    page_size=page_size,
+                )
             )
-        )
+        finally:
+            if owned:
+                await service.aclose()
 
 
 async def xero_get_payments(
@@ -555,10 +610,15 @@ async def xero_get_payments(
             "xero_get_payments",
             context.permissions,
         )
-        settings = get_settings()
-        if not settings.xero_configured:
+        acquired = await _acquire_service()
+        if acquired is None:
             return not_configured("xero", _NOT_CONFIGURED_MESSAGE)
-        return await _call(_get_service().get_payments(page=page, page_size=page_size))
+        service, owned = acquired
+        try:
+            return await _call(service.get_payments(page=page, page_size=page_size))
+        finally:
+            if owned:
+                await service.aclose()
 
 
 async def xero_create_invoice(
@@ -603,61 +663,65 @@ async def xero_create_invoice(
             "xero_create_invoice",
             context.permissions,
         )
-        settings = get_settings()
-        if not settings.xero_configured:
+        acquired = await _acquire_service()
+        if acquired is None:
             return not_configured("xero", _NOT_CONFIGURED_MESSAGE)
-
-        if not isinstance(line_items, list) or not line_items:
-            return integration_error("xero", "line_items must be a non-empty list")
-        normalised: list[dict[str, Any]] = []
-        for idx, item in enumerate(line_items):
-            if not isinstance(item, dict):
-                return integration_error(
-                    "xero", f"line_items[{idx}] must be a dict"
-                )
-            description = item.get("Description", item.get("description"))
-            quantity = item.get("Quantity", item.get("quantity"))
-            unit_amount = item.get("UnitAmount", item.get("unit_amount"))
-            if description is None or quantity is None or unit_amount is None:
-                return integration_error(
-                    "xero",
-                    f"line_items[{idx}] requires description, quantity, unit_amount",
-                )
-            normalised.append(
-                {
-                    "Description": description,
-                    "Quantity": quantity,
-                    "UnitAmount": unit_amount,
-                }
-            )
-
+        service, owned = acquired
         try:
-            time.strptime(due_date, "%Y-%m-%d")
-        except (TypeError, ValueError):
-            return integration_error(
-                "xero", "due_date must be an ISO date (YYYY-MM-DD)"
-            )
+            if not isinstance(line_items, list) or not line_items:
+                return integration_error("xero", "line_items must be a non-empty list")
+            normalised: list[dict[str, Any]] = []
+            for idx, item in enumerate(line_items):
+                if not isinstance(item, dict):
+                    return integration_error(
+                        "xero", f"line_items[{idx}] must be a dict"
+                    )
+                description = item.get("Description", item.get("description"))
+                quantity = item.get("Quantity", item.get("quantity"))
+                unit_amount = item.get("UnitAmount", item.get("unit_amount"))
+                if description is None or quantity is None or unit_amount is None:
+                    return integration_error(
+                        "xero",
+                        f"line_items[{idx}] requires description, quantity, unit_amount",
+                    )
+                normalised.append(
+                    {
+                        "Description": description,
+                        "Quantity": quantity,
+                        "UnitAmount": unit_amount,
+                    }
+                )
 
-        # Duplicate the try/except shape from `_call` here rather than
-        # threading create-invoice through it — `_call` returns ok(data)
-        # but we want a shaped success payload (invoice_id, url, …) that
-        # the helper would obscure.
-        try:
-            data = await _get_service().create_invoice(
-                contact_id=contact_id,
-                line_items=normalised,
-                due_date=due_date,
-                reference=reference,
-            )
-        except httpx.HTTPStatusError as exc:
-            return integration_error(
-                "xero", f"Xero API returned HTTP {exc.response.status_code}"
-            )
-        except httpx.RequestError as exc:
-            return integration_error(
-                "xero", f"Xero request failed: {exc.__class__.__name__}"
-            )
-        return ok("xero", data)
+            try:
+                time.strptime(due_date, "%Y-%m-%d")
+            except (TypeError, ValueError):
+                return integration_error(
+                    "xero", "due_date must be an ISO date (YYYY-MM-DD)"
+                )
+
+            # Duplicate the try/except shape from `_call` here rather than
+            # threading create-invoice through it — `_call` returns ok(data)
+            # but we want a shaped success payload (invoice_id, url, …) that
+            # the helper would obscure.
+            try:
+                data = await service.create_invoice(
+                    contact_id=contact_id,
+                    line_items=normalised,
+                    due_date=due_date,
+                    reference=reference,
+                )
+            except httpx.HTTPStatusError as exc:
+                return integration_error(
+                    "xero", f"Xero API returned HTTP {exc.response.status_code}"
+                )
+            except httpx.RequestError as exc:
+                return integration_error(
+                    "xero", f"Xero request failed: {exc.__class__.__name__}"
+                )
+            return ok("xero", data)
+        finally:
+            if owned:
+                await service.aclose()
 
 
 async def xero_get_profit_loss(
@@ -686,12 +750,17 @@ async def xero_get_profit_loss(
             "xero_get_profit_loss",
             context.permissions,
         )
-        settings = get_settings()
-        if not settings.xero_configured:
+        acquired = await _acquire_service()
+        if acquired is None:
             return not_configured("xero", _NOT_CONFIGURED_MESSAGE)
-        return await _call(
-            _get_service().get_profit_loss(from_date=from_date, to_date=to_date)
-        )
+        service, owned = acquired
+        try:
+            return await _call(
+                service.get_profit_loss(from_date=from_date, to_date=to_date)
+            )
+        finally:
+            if owned:
+                await service.aclose()
 
 
 def register(mcp: Any) -> None:

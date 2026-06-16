@@ -21,6 +21,7 @@ from typing import Any
 import httpx
 
 from agents.mcp.config import MCPSettings, get_settings
+from agents.mcp.credentials import resolve_settings
 from agents.mcp.integrations import error as integration_error
 from agents.mcp.integrations import not_configured, ok
 from agents.mcp.permissions import check_permission
@@ -234,7 +235,7 @@ async def cin7_get_inventory(
             "cin7_get_inventory",
             context.permissions,
         )
-        settings = get_settings()
+        settings = (await resolve_settings("cin7")).settings
         if not settings.cin7_configured:
             return not_configured("cin7", "CIN7_API_KEY/CIN7_ACCOUNT_ID are not configured.")
         service = Cin7Service(settings)
@@ -272,7 +273,7 @@ async def cin7_get_stock_levels(
             "cin7_get_stock_levels",
             context.permissions,
         )
-        settings = get_settings()
+        settings = (await resolve_settings("cin7")).settings
         if not settings.cin7_configured:
             return not_configured("cin7", "CIN7_API_KEY/CIN7_ACCOUNT_ID are not configured.")
         service = Cin7Service(settings)
@@ -318,7 +319,7 @@ async def cin7_get_sales_orders(
             "cin7_get_sales_orders",
             context.permissions,
         )
-        settings = get_settings()
+        settings = (await resolve_settings("cin7")).settings
         if not settings.cin7_configured:
             return not_configured("cin7", "CIN7_API_KEY/CIN7_ACCOUNT_ID are not configured.")
         service = Cin7Service(settings)
@@ -368,7 +369,7 @@ async def cin7_get_purchase_orders(
             "cin7_get_purchase_orders",
             context.permissions,
         )
-        settings = get_settings()
+        settings = (await resolve_settings("cin7")).settings
         if not settings.cin7_configured:
             return not_configured("cin7", "CIN7_API_KEY/CIN7_ACCOUNT_ID are not configured.")
         service = Cin7Service(settings)
