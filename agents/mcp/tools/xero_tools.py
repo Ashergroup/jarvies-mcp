@@ -34,13 +34,14 @@ import base64
 import logging
 import os
 import time
+from collections.abc import Awaitable, Callable
 from pathlib import Path
 from typing import Any
 
 import httpx
 
 from agents.mcp.config import MCPSettings, get_settings
-from agents.mcp.credentials import resolve_settings
+from agents.mcp.credentials import persist_xero_refresh_token, resolve_settings
 from agents.mcp.integrations import error as integration_error
 from agents.mcp.integrations import not_configured, ok
 from agents.mcp.permissions import check_permission
@@ -123,6 +124,7 @@ class XeroService:
         settings: MCPSettings | None = None,
         *,
         use_persisted_refresh_token: bool = True,
+        on_refresh_rotated: Callable[[str], Awaitable[None]] | None = None,
     ) -> None:
         self._settings = settings or get_settings()
         self._client: httpx.AsyncClient | None = None
@@ -130,8 +132,11 @@ class XeroService:
         # The on-disk rotation file belongs to the env/singleton (Asher) path.
         # Per-tenant services built from DB credentials pass
         # use_persisted_refresh_token=False so tenants never read or overwrite
-        # each other's token via that shared file.
+        # each other's token via that shared file. Such services instead supply
+        # on_refresh_rotated, an async hook that persists the rotated token back
+        # to the tenant's DB row.
         self._use_persisted_refresh_token = use_persisted_refresh_token
+        self._on_refresh_rotated = on_refresh_rotated
         if use_persisted_refresh_token:
             # File on disk wins over env so we never use a stale .env value after
             # the very first rotation.
@@ -203,9 +208,20 @@ class XeroService:
             self._refresh_token = new_refresh
             if not self._use_persisted_refresh_token:
                 # Per-tenant (DB-sourced) service: never touch the shared on-disk
-                # file. The rotated token lives only for this call; persisting it
-                # back to the tenant's DB row is a separate follow-up.
-                log.warning("Xero rotated refresh token for a per-tenant service")
+                # file. Persist the rotated token back to the tenant's DB row so
+                # the next call doesn't reuse the consumed (single-use) token.
+                if self._on_refresh_rotated is not None:
+                    try:
+                        await self._on_refresh_rotated(new_refresh)
+                    except Exception:
+                        # Defensive: the hook is already best-effort, but never
+                        # let a persistence problem fail the original call.
+                        log.warning(
+                            "Xero rotated refresh token but DB persistence failed; "
+                            "token kept in memory only for this call"
+                        )
+                else:
+                    log.warning("Xero rotated refresh token for a per-tenant service")
             else:
                 try:
                     _write_persisted_refresh_token(new_refresh)
@@ -441,7 +457,8 @@ async def _acquire_service() -> tuple[XeroService, bool] | None:
         the caller must ``aclose()`` it.
     """
 
-    if current_tenant() is None:
+    tenant = current_tenant()
+    if tenant is None:
         if not get_settings().xero_configured:
             return None
         return _get_service(), False
@@ -450,7 +467,19 @@ async def _acquire_service() -> tuple[XeroService, bool] | None:
     if not resolved.settings.xero_configured:
         return None
     if resolved.from_db:
-        return XeroService(resolved.settings, use_persisted_refresh_token=False), True
+        tenant_db_id = tenant["id"]
+
+        async def _persist_rotation(new_token: str) -> None:
+            await persist_xero_refresh_token(tenant_db_id, new_token)
+
+        return (
+            XeroService(
+                resolved.settings,
+                use_persisted_refresh_token=False,
+                on_refresh_rotated=_persist_rotation,
+            ),
+            True,
+        )
     return _get_service(), False
 
 

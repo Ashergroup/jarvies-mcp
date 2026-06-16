@@ -229,3 +229,144 @@ async def test_xero_uses_db_credentials(
     assert "grant_type=refresh_token" in body
     assert "refresh_token=tenant-refresh-token" in body
     assert "client_id=tenant-cid" in body
+
+
+# ---------------------------------------------------------------------------
+# Xero refresh-token rotation persisted back to the DB (#5C)
+# ---------------------------------------------------------------------------
+
+
+class _FakeConn:
+    def __init__(self, recorder: list) -> None:
+        self._recorder = recorder
+
+    async def execute(self, query: str, *args) -> None:
+        self._recorder.append((query, args))
+
+
+class _FakeConnCtx:
+    def __init__(self, recorder: list) -> None:
+        self._recorder = recorder
+
+    async def __aenter__(self) -> _FakeConn:
+        return _FakeConn(self._recorder)
+
+    async def __aexit__(self, *exc) -> bool:
+        return False
+
+
+@pytest.mark.asyncio
+async def test_persist_xero_refresh_token_executes_update(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    recorder: list = []
+    monkeypatch.setattr(credentials, "get_conn", lambda: _FakeConnCtx(recorder))
+
+    await credentials.persist_xero_refresh_token(TENANT["id"], "rotated-token")
+
+    assert len(recorder) == 1
+    query, args = recorder[0]
+    assert "UPDATE tenant_credentials" in query
+    assert "credential_key = $1" in query
+    assert args == ("rotated-token", TENANT["id"])
+
+
+@pytest.mark.asyncio
+async def test_persist_xero_refresh_token_swallows_db_error(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def boom():
+        raise RuntimeError("db down")
+
+    monkeypatch.setattr(credentials, "get_conn", boom)
+    # Must not raise.
+    await credentials.persist_xero_refresh_token(TENANT["id"], "rotated-token")
+
+
+@pytest.mark.asyncio
+async def test_xero_rotation_persisted_to_db_after_refresh(
+    monkeypatch: pytest.MonkeyPatch, _with_tenant
+) -> None:
+    monkeypatch.setenv("XERO_IDENTITY_URL", "https://identity.test/connect/token")
+    monkeypatch.setenv("XERO_BASE_URL", "https://api.test/api.xro/2.0")
+    mcp_config.get_settings.cache_clear()
+
+    async def fake_db(tenant_id: str, credential_type: str):
+        return {
+            "credential_key": "old-refresh",
+            "metadata": {
+                "client_id": "cid",
+                "client_secret": "csec",
+                "tenant_id": "xero-tid",
+            },
+        }
+
+    monkeypatch.setattr(credentials, "get_tenant_credentials", fake_db)
+
+    # Capture the write-back UPDATE without a real DB.
+    recorder: list = []
+    monkeypatch.setattr(credentials, "get_conn", lambda: _FakeConnCtx(recorder))
+
+    with respx.mock(assert_all_called=True) as mock:
+        mock.post("https://identity.test/connect/token").mock(
+            return_value=httpx.Response(
+                200,
+                json={
+                    "access_token": "tok",
+                    "expires_in": 1800,
+                    "refresh_token": "rotated-new-token",
+                },
+            )
+        )
+        mock.get("https://api.test/api.xro/2.0/Contacts").mock(
+            return_value=httpx.Response(200, json={"Contacts": []})
+        )
+        result = await xero_tools.xero_get_contacts(permissions=["finance_access"])
+
+    assert result["status"] == "ok"
+    # The rotated token was persisted back to the tenant's DB row.
+    assert len(recorder) == 1
+    query, args = recorder[0]
+    assert "UPDATE tenant_credentials" in query
+    assert args == ("rotated-new-token", TENANT["id"])
+
+
+@pytest.mark.asyncio
+async def test_xero_call_succeeds_even_if_rotation_persist_fails(
+    monkeypatch: pytest.MonkeyPatch, _with_tenant
+) -> None:
+    monkeypatch.setenv("XERO_IDENTITY_URL", "https://identity.test/connect/token")
+    monkeypatch.setenv("XERO_BASE_URL", "https://api.test/api.xro/2.0")
+    mcp_config.get_settings.cache_clear()
+
+    async def fake_db(tenant_id: str, credential_type: str):
+        return {
+            "credential_key": "old-refresh",
+            "metadata": {"client_id": "cid", "client_secret": "csec", "tenant_id": "x"},
+        }
+
+    monkeypatch.setattr(credentials, "get_tenant_credentials", fake_db)
+
+    def boom():
+        raise RuntimeError("db down")
+
+    monkeypatch.setattr(credentials, "get_conn", boom)
+
+    with respx.mock(assert_all_called=True) as mock:
+        mock.post("https://identity.test/connect/token").mock(
+            return_value=httpx.Response(
+                200,
+                json={
+                    "access_token": "tok",
+                    "expires_in": 1800,
+                    "refresh_token": "rotated-new-token",
+                },
+            )
+        )
+        mock.get("https://api.test/api.xro/2.0/Contacts").mock(
+            return_value=httpx.Response(200, json={"Contacts": []})
+        )
+        result = await xero_tools.xero_get_contacts(permissions=["finance_access"])
+
+    # Persistence failed, but the original Xero call still succeeded.
+    assert result["status"] == "ok"
