@@ -340,6 +340,17 @@ class ClickUpService:
             json_body=body,
         )
 
+    async def create_subtask(
+        self,
+        parent_task_id: str,
+        body: dict[str, Any],
+    ) -> dict[str, Any]:
+        return await self._request(
+            "POST",
+            f"task/{parent_task_id}",
+            json_body=body,
+        )
+
 
 def _extract_clickup_error(response: httpx.Response) -> str:
     try:
@@ -1313,13 +1324,25 @@ async def clickup_create_subtask(
     description: str | None = None,
     assignee_id: int | None = None,
     due_date_ms: int | None = None,
-    list_key: str = IR_KEY,
+    list_key: str | None = IR_KEY,
+    list_id: str | None = None,
     tenant_id: str | None = None,
     user_id: str | None = None,
     access_token: str | None = None,
     permissions: list[str] | None = None,
 ) -> dict[str, Any]:
-    """Create a subtask under a task in ``list_key``'s list."""
+    """Create a subtask under a parent task.
+
+    The list the subtask lands in is resolved in order:
+
+    * a raw ``list_id`` (when provided) bypasses the config lookup entirely and
+      is used directly;
+    * otherwise ``list_key`` is resolved against the configured lists (the
+      existing, backward-compatible behaviour);
+    * if neither yields a list — an unknown ``list_key`` or one not wired in
+      config — list validation is skipped and the subtask is created directly
+      against the parent task (``POST /task/{parent_task_id}``).
+    """
 
     context = _context(tenant_id, user_id, access_token, permissions)
     with use_tenant_context(context):
@@ -1339,24 +1362,35 @@ async def clickup_create_subtask(
         if config is None or not isinstance(config, ClickUpListsConfig):
             return _not_configured([str(settings.clickup_fields_config_path)])
 
-        resolved = _resolve_list(settings, config, list_key)
-        if isinstance(resolved, dict):
-            return resolved
-        _list_cfg, list_id = resolved
-
         if not isinstance(name, str) or not name.strip():
             return _error(400, "name must be a non-empty string")
 
-        body: dict[str, Any] = {"name": name, "parent": parent_task_id}
+        # Resolve a target list id without erroring on an unknown key: a raw
+        # list_id wins; otherwise try the config; otherwise fall through.
+        resolved_list_id: str | None = None
+        if list_id:
+            resolved_list_id = list_id
+        elif list_key:
+            resolved = _resolve_list(settings, config, list_key)
+            if isinstance(resolved, tuple):
+                _list_cfg, resolved_list_id = resolved
+
+        extra: dict[str, Any] = {}
         if description is not None:
-            body["description"] = description
+            extra["description"] = description
         if assignee_id is not None:
-            body["assignees"] = [assignee_id]
+            extra["assignees"] = [assignee_id]
         if due_date_ms is not None:
-            body["due_date"] = due_date_ms
+            extra["due_date"] = due_date_ms
 
         async def _do(service: ClickUpService) -> dict[str, Any]:
-            response = await service.create_task(list_id, body)
+            if resolved_list_id:
+                body = {"name": name, "parent": parent_task_id, **extra}
+                response = await service.create_task(resolved_list_id, body)
+            else:
+                # No list resolved — create directly under the parent task.
+                body = {"name": name, **extra}
+                response = await service.create_subtask(parent_task_id, body)
             subtask_id = response.get("id") if isinstance(response, dict) else None
             log.info(
                 "clickup_create_subtask",
@@ -1365,6 +1399,7 @@ async def clickup_create_subtask(
                     "parent_task_id": parent_task_id,
                     "subtask_id": subtask_id,
                     "list_key": list_key,
+                    "list_id": resolved_list_id,
                 },
             )
             return _ok(parent_task_id=parent_task_id, subtask_id=subtask_id)

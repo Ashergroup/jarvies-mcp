@@ -700,3 +700,113 @@ async def test_legacy_config_is_rejected_with_clear_error(
     assert result["code"] == 500
     assert "scripts/setup_clickup_fields.py" in result["message"]
     assert "legacy" in result["message"].lower()
+
+
+# ---------------------------------------------------------------------------
+# 18. clickup_create_subtask — dynamic list resolution (#7B).
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_create_subtask_with_known_list_key_uses_config(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    # Backward compatible: a configured list_key still creates in that list.
+    fields_path = tmp_path / "clickup_fields.json"
+    _write_multi_list_config(fields_path)
+    _set_clickup_env(monkeypatch, fields_path)
+
+    with respx.mock(assert_all_called=True) as mock:
+        route = mock.post(
+            f"https://api.clickup.test/api/v2/list/{IR_LIST_ID}/task"
+        ).mock(return_value=httpx.Response(200, json={"id": "sub-cfg"}))
+        result = await clickup_tools.clickup_create_subtask(
+            parent_task_id="pt1",
+            name="Configured subtask",
+            list_key="investor_relations",
+            permissions=["fundraising_access"],
+        )
+
+    assert result["status"] == "ok"
+    assert result["subtask_id"] == "sub-cfg"
+    body = json.loads(route.calls[0].request.content.decode())
+    assert body["parent"] == "pt1"
+    assert body["name"] == "Configured subtask"
+
+
+@pytest.mark.asyncio
+async def test_create_subtask_with_raw_list_id_bypasses_config(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    fields_path = tmp_path / "clickup_fields.json"
+    _write_multi_list_config(fields_path)
+    _set_clickup_env(monkeypatch, fields_path)
+
+    with respx.mock(assert_all_called=True) as mock:
+        route = mock.post(
+            "https://api.clickup.test/api/v2/list/raw-list-999/task"
+        ).mock(return_value=httpx.Response(200, json={"id": "sub-raw"}))
+        result = await clickup_tools.clickup_create_subtask(
+            parent_task_id="pt1",
+            name="Raw subtask",
+            description="hello",
+            list_id="raw-list-999",
+            permissions=["fundraising_access"],
+        )
+
+    assert result["status"] == "ok"
+    assert result["subtask_id"] == "sub-raw"
+    body = json.loads(route.calls[0].request.content.decode())
+    assert body["parent"] == "pt1"
+    assert body["description"] == "hello"
+
+
+@pytest.mark.asyncio
+async def test_create_subtask_without_list_key_falls_through(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    # list_key=None and no list_id → create directly under the parent task.
+    fields_path = tmp_path / "clickup_fields.json"
+    _write_multi_list_config(fields_path)
+    _set_clickup_env(monkeypatch, fields_path)
+
+    with respx.mock(assert_all_called=True) as mock:
+        route = mock.post("https://api.clickup.test/api/v2/task/pt1").mock(
+            return_value=httpx.Response(200, json={"id": "sub-direct"})
+        )
+        result = await clickup_tools.clickup_create_subtask(
+            parent_task_id="pt1",
+            name="No-list subtask",
+            list_key=None,
+            permissions=["fundraising_access"],
+        )
+
+    assert result["status"] == "ok"
+    assert result["subtask_id"] == "sub-direct"
+    body = json.loads(route.calls[0].request.content.decode())
+    assert body["name"] == "No-list subtask"
+    # parent is in the URL for the direct endpoint, not the body.
+    assert "parent" not in body
+
+
+@pytest.mark.asyncio
+async def test_create_subtask_unknown_list_key_falls_through(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    fields_path = tmp_path / "clickup_fields.json"
+    _write_multi_list_config(fields_path)
+    _set_clickup_env(monkeypatch, fields_path)
+
+    with respx.mock(assert_all_called=True) as mock:
+        mock.post("https://api.clickup.test/api/v2/task/pt1").mock(
+            return_value=httpx.Response(200, json={"id": "sub-unknown"})
+        )
+        result = await clickup_tools.clickup_create_subtask(
+            parent_task_id="pt1",
+            name="Adhoc subtask",
+            list_key="not_a_real_list",
+            permissions=["fundraising_access"],
+        )
+
+    assert result["status"] == "ok"
+    assert result["subtask_id"] == "sub-unknown"
