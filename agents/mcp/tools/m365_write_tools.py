@@ -30,6 +30,7 @@ import base64
 import logging
 import os
 import time
+from datetime import UTC, datetime, timedelta
 from typing import Any
 
 import httpx
@@ -46,6 +47,20 @@ GRAPH_BASE = "https://graph.microsoft.com/v1.0"
 
 # Returned when no Microsoft access token can be resolved for a tool call.
 _NO_TOKEN_MESSAGE = "No M365 access token available — please reconnect via OAuth"
+
+# Microsoft identity-platform token endpoint (per-tenant). Used to refresh an
+# expired delegated access token from a stored refresh token.
+_MS_TOKEN_URL = "https://login.microsoftonline.com/{tenant}/oauth2/v2.0/token"
+
+# Delegated scopes requested on refresh — the write/read surface this module
+# needs, plus offline_access so Microsoft keeps issuing refresh tokens.
+_REFRESH_SCOPE = (
+    "offline_access Mail.ReadWrite Mail.Send Calendars.ReadWrite "
+    "Files.ReadWrite.All Sites.ReadWrite.All ChannelMessage.Send Chat.ReadWrite"
+)
+
+# Refresh proactively once the stored token is within this window of expiry.
+_REFRESH_SKEW_SECONDS = 300
 
 
 def _ok(data: dict[str, Any]) -> dict[str, Any]:
@@ -98,19 +113,166 @@ async def _lookup_user_token(user_id: str) -> str | None:
     return row["access_token"] or None
 
 
+async def _lookup_user_token_record(user_id: str) -> dict[str, Any] | None:
+    """Return the stored Microsoft token row for a user, or None.
+
+    Unlike ``_lookup_user_token`` (which yields only the access token), this
+    returns the access token plus the ``refresh_token`` and ``expires_at``
+    needed to drive a proactive refresh. Never raises: a missing or unreachable
+    database degrades to None so the caller falls back to its other paths.
+    """
+
+    try:
+        async with get_conn() as conn:
+            row = await conn.fetchrow(
+                "SELECT access_token, refresh_token, expires_at FROM user_tokens "
+                "WHERE user_id::text = $1 ORDER BY updated_at DESC LIMIT 1",
+                user_id,
+            )
+    except Exception:
+        log.warning("m365_token_lookup_failed")
+        return None
+    if row is None:
+        return None
+    return dict(row)
+
+
+def _token_is_stale(expires_at: datetime | None) -> bool:
+    """True when a stored token is expired or within the refresh skew window."""
+
+    if expires_at is None:
+        return False
+    return expires_at <= datetime.now(UTC) + timedelta(seconds=_REFRESH_SKEW_SECONDS)
+
+
+async def _persist_refreshed_token(
+    user_id: str,
+    access_token: str,
+    refresh_token: str,
+    expires_in: int | None,
+) -> None:
+    """Write a refreshed M365 token set back to ``user_tokens``.
+
+    Mirrors the Xero rotation write-back in
+    ``credentials.persist_xero_refresh_token``: best-effort, so any failure is
+    logged and swallowed and the in-flight Graph call still proceeds with the
+    new in-memory token. Token values are never logged.
+    """
+
+    expires_at = None
+    if expires_in:
+        expires_at = datetime.now(UTC) + timedelta(seconds=int(expires_in))
+    try:
+        async with get_conn() as conn:
+            await conn.execute(
+                """
+                UPDATE user_tokens
+                SET access_token = $1, refresh_token = $2, expires_at = $3,
+                    updated_at = NOW()
+                WHERE user_id::text = $4
+                """,
+                access_token,
+                refresh_token,
+                expires_at,
+                user_id,
+            )
+        log.info("m365_token_refreshed", extra={"user_id": user_id})
+    except Exception:
+        log.warning(
+            "m365_token_refresh_persist_failed — token kept in memory for this call",
+            extra={"user_id": user_id},
+        )
+
+
+async def _maybe_refresh_token(
+    user_id: str,
+    record: dict[str, Any],
+    *,
+    force: bool = False,
+) -> str | None:
+    """Proactively refresh a stored access token, returning the new one.
+
+    Refreshes when the stored token is expired/near-expiry, or when ``force``
+    (a Graph 401 retry). On success, persists the rotated access/refresh tokens
+    back to ``user_tokens`` and returns the new access token. On any failure —
+    no refresh token, missing Azure config, a non-2xx token response, transport
+    error — logs a warning and returns None so the caller keeps using the
+    existing token. Never breaks the tool call.
+    """
+
+    refresh_token = record.get("refresh_token")
+    if not refresh_token:
+        return None
+    if not force and not _token_is_stale(record.get("expires_at")):
+        return None
+
+    settings = get_settings()
+    if not (
+        settings.azure_client_id
+        and settings.azure_client_secret
+        and settings.azure_tenant_id
+    ):
+        return None
+
+    form = {
+        "grant_type": "refresh_token",
+        "refresh_token": refresh_token,
+        "client_id": settings.azure_client_id,
+        "client_secret": settings.azure_client_secret,
+        "scope": _REFRESH_SCOPE,
+    }
+    try:
+        async with httpx.AsyncClient(
+            timeout=settings.integration_http_timeout_seconds
+        ) as client:
+            response = await client.post(
+                _MS_TOKEN_URL.format(tenant=settings.azure_tenant_id), data=form
+            )
+        response.raise_for_status()
+        payload = response.json()
+    except (httpx.HTTPError, ValueError):
+        log.warning(
+            "m365_token_refresh_failed — using existing token",
+            extra={"user_id": user_id},
+        )
+        return None
+
+    new_access = payload.get("access_token")
+    if not new_access:
+        log.warning(
+            "m365_token_refresh_missing_access_token — using existing token",
+            extra={"user_id": user_id},
+        )
+        return None
+    # Microsoft may or may not rotate the refresh token; reuse the old one when
+    # it does not return a fresh value.
+    new_refresh = payload.get("refresh_token") or refresh_token
+    await _persist_refreshed_token(
+        user_id, new_access, new_refresh, payload.get("expires_in")
+    )
+    return new_access
+
+
 async def _get_m365_token(
     access_token: str | None,
     user_id: str | None,
     tenant_id: str | None,
+    *,
+    force_refresh: bool = False,
 ) -> str | None:
     """Resolve the Microsoft access token for an M365 tool call.
 
     Priority:
       1. An explicitly supplied ``access_token`` (backward compatible — the
-         existing test/Claude-Desktop path).
+         existing test/Claude-Desktop path). Explicit tokens are returned as-is
+         and never refreshed.
       2. The token stored for the authenticated user at OAuth-callback time.
          The user is taken from the request's bearer-token identity
          (``tenant.current_user_id``), or an explicit non-default ``user_id``.
+         The stored token is proactively refreshed when expired or within five
+         minutes of expiry — or unconditionally when ``force_refresh`` is set
+         (the one-shot retry path after a Graph 401). A failed refresh falls
+         back to the existing token (best effort).
 
     Returns None when neither is available; callers then return
     ``_NO_TOKEN_MESSAGE``. ``tenant_id`` is accepted for call-site symmetry.
@@ -125,7 +287,44 @@ async def _get_m365_token(
     if not effective_user_id:
         return None
 
+    record = await _lookup_user_token_record(effective_user_id)
+    if record is not None:
+        refreshed = await _maybe_refresh_token(
+            effective_user_id, record, force=force_refresh
+        )
+        if refreshed:
+            return refreshed
+        if record.get("access_token"):
+            return record["access_token"]
+
+    # Fall back to the access-token-only lookup (keeps partial rows and the
+    # existing token-resolution tests working when no record is available).
     return await _lookup_user_token(effective_user_id)
+
+
+async def _retry_on_401(context: Any, token: str, attempt: Any) -> Any:
+    """Run ``attempt(token)``; on a Graph 401 refresh the token and retry once.
+
+    ``attempt`` is an async callable that performs the tool's Graph request(s)
+    with the supplied token. A 401 means the access token was rejected (expired
+    or revoked) after resolution; we re-resolve with ``force_refresh`` — which
+    rotates the stored token via ``_get_m365_token`` — and retry exactly once.
+    Any other status, or a second failure, propagates to the caller's handler.
+    Never loops.
+    """
+
+    try:
+        return await attempt(token)
+    except httpx.HTTPStatusError as exc:
+        if exc.response.status_code != 401:
+            raise
+    new_token = await _get_m365_token(
+        context.access_token,
+        context.user_id,
+        context.tenant_id,
+        force_refresh=True,
+    )
+    return await attempt(new_token or token)
 
 
 async def _graph_request(
@@ -269,8 +468,11 @@ async def m365_send_email(
             ]
         payload = {"message": message, "saveToSentItems": True}
 
+        async def _attempt(tok: str) -> dict[str, Any]:
+            return await _graph_request("POST", "/me/sendMail", tok, json=payload)
+
         try:
-            await _graph_request("POST", "/me/sendMail", token, json=payload)
+            await _retry_on_401(context, token, _attempt)
         except httpx.HTTPStatusError as exc:
             return _err(f"Graph sendMail failed: HTTP {exc.response.status_code}")
         except httpx.RequestError as exc:
@@ -341,8 +543,11 @@ async def m365_create_calendar_event(
             event["isOnlineMeeting"] = True
             event["onlineMeetingProvider"] = "teamsForBusiness"
 
+        async def _attempt(tok: str) -> dict[str, Any]:
+            return await _graph_request("POST", "/me/events", tok, json=event)
+
         try:
-            created = await _graph_request("POST", "/me/events", token, json=event)
+            created = await _retry_on_401(context, token, _attempt)
         except httpx.HTTPStatusError as exc:
             return _err(f"Graph create event failed: HTTP {exc.response.status_code}")
         except httpx.RequestError as exc:
@@ -408,20 +613,25 @@ async def m365_upload_to_sharepoint(
         except OSError as exc:
             return _err(f"Could not read local file {file_path!r}: {exc.__class__.__name__}")
 
-        try:
-            drive_id, folder_id = await _resolve_drive_item(destination_folder_url, token)
+        async def _attempt(tok: str) -> dict[str, Any] | None:
+            drive_id, folder_id = await _resolve_drive_item(destination_folder_url, tok)
             if not drive_id or not folder_id:
+                return None
+            return await _graph_request(
+                "PUT",
+                f"/drives/{drive_id}/items/{folder_id}:/{name}:/content",
+                tok,
+                content=content,
+                headers={"Content-Type": "application/octet-stream"},
+            )
+
+        try:
+            uploaded = await _retry_on_401(context, token, _attempt)
+            if uploaded is None:
                 return _err(
                     "Could not resolve destination folder from "
                     f"{destination_folder_url!r}"
                 )
-            uploaded = await _graph_request(
-                "PUT",
-                f"/drives/{drive_id}/items/{folder_id}:/{name}:/content",
-                token,
-                content=content,
-                headers={"Content-Type": "application/octet-stream"},
-            )
         except httpx.HTTPStatusError as exc:
             return _err(f"Graph upload failed: HTTP {exc.response.status_code}")
         except httpx.RequestError as exc:
@@ -472,23 +682,29 @@ async def m365_create_sharepoint_folder(
         if not token:
             return _err(_NO_TOKEN_MESSAGE)
 
-        try:
-            drive_id, parent_id = await _resolve_drive_item(parent_folder_url, token)
+        payload = {
+            "name": folder_name,
+            "folder": {},
+            "@microsoft.graph.conflictBehavior": "fail",
+        }
+
+        async def _attempt(tok: str) -> dict[str, Any] | None:
+            drive_id, parent_id = await _resolve_drive_item(parent_folder_url, tok)
             if not drive_id or not parent_id:
+                return None
+            return await _graph_request(
+                "POST",
+                f"/drives/{drive_id}/items/{parent_id}/children",
+                tok,
+                json=payload,
+            )
+
+        try:
+            created = await _retry_on_401(context, token, _attempt)
+            if created is None:
                 return _err(
                     f"Could not resolve parent folder from {parent_folder_url!r}"
                 )
-            payload = {
-                "name": folder_name,
-                "folder": {},
-                "@microsoft.graph.conflictBehavior": "fail",
-            }
-            created = await _graph_request(
-                "POST",
-                f"/drives/{drive_id}/items/{parent_id}/children",
-                token,
-                json=payload,
-            )
         except httpx.HTTPStatusError as exc:
             return _err(f"Graph create folder failed: HTTP {exc.response.status_code}")
         except httpx.RequestError as exc:
@@ -555,8 +771,11 @@ async def m365_post_teams_message(
         else:
             path = f"/chats/{channel_or_chat_id}/messages"
 
+        async def _attempt(tok: str) -> dict[str, Any]:
+            return await _graph_request("POST", path, tok, json=payload)
+
         try:
-            created = await _graph_request("POST", path, token, json=payload)
+            created = await _retry_on_401(context, token, _attempt)
         except httpx.HTTPStatusError as exc:
             return _err(f"Graph post message failed: HTTP {exc.response.status_code}")
         except httpx.RequestError as exc:
