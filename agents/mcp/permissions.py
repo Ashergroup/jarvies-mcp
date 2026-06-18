@@ -98,6 +98,8 @@ TOOL_POLICIES: dict[str, ToolPolicy] = {
     "clickup_get_spaces": ToolPolicy(required_any={"fundraising_access"}),
     "clickup_get_folders": ToolPolicy(required_any={"fundraising_access"}),
     "clickup_get_members": ToolPolicy(required_any={"fundraising_access"}),
+    "clickup_get_lists": ToolPolicy(required_any={"fundraising_access"}),
+    "clickup_list_tasks_by_id": ToolPolicy(required_any={"fundraising_access"}),
     "clickup_create_folder": ToolPolicy(
         required_any={"fundraising_access"}, write=True
     ),

@@ -85,6 +85,17 @@ class ClickUpWriteService(ClickUpService):
     async def create_form(self, list_id: str, body: dict[str, Any]) -> dict[str, Any]:
         return await self._request("POST", f"list/{list_id}/view", json_body=body)
 
+    async def get_lists_in_folder(self, folder_id: str) -> dict[str, Any]:
+        return await self._request("GET", f"folder/{folder_id}/list")
+
+    async def get_lists_in_space(self, space_id: str) -> dict[str, Any]:
+        return await self._request("GET", f"space/{space_id}/list")
+
+    async def list_tasks_by_id(
+        self, list_id: str, params: dict[str, Any]
+    ) -> dict[str, Any]:
+        return await self._request("GET", f"list/{list_id}/task", params=params)
+
 
 def _missing_token(settings: MCPSettings) -> list[str]:
     """These tools only require the API token (no custom-fields config)."""
@@ -118,6 +129,34 @@ def _view_of(payload: Any) -> dict[str, Any]:
             return view
         return payload
     return {}
+
+
+def _map_raw_task(task: dict[str, Any]) -> dict[str, Any]:
+    """Map a raw ClickUp task to a generic shape (no per-list field schema).
+
+    Used by the config-free ``clickup_list_tasks_by_id`` — unlike the
+    config-bound tools in ``clickup_tools.py``, custom-field UUIDs are NOT
+    decoded to human names here because no list schema is loaded.
+    """
+
+    status = task.get("status")
+    status_name = status.get("status") if isinstance(status, dict) else status
+    priority = task.get("priority")
+    priority_name = priority.get("priority") if isinstance(priority, dict) else priority
+    assignees = [
+        a.get("username") or a.get("email") or str(a.get("id", ""))
+        for a in (task.get("assignees") or [])
+        if isinstance(a, dict)
+    ]
+    return {
+        "id": task.get("id", ""),
+        "name": task.get("name", ""),
+        "status": status_name,
+        "assignee": assignees,
+        "due_date": task.get("due_date"),
+        "priority": priority_name,
+        "description": task.get("description") or task.get("text_content"),
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -238,6 +277,100 @@ async def clickup_get_members(
             return _ok(list_id=list_id, count=len(results), members=results)
 
         return await _run(_do, "clickup_get_members", settings)
+
+
+async def clickup_get_lists(
+    folder_id: str | None = None,
+    space_id: str | None = None,
+    tenant_id: str | None = None,
+    user_id: str | None = None,
+    access_token: str | None = None,
+    permissions: list[str] | None = None,
+) -> dict[str, Any]:
+    """List the lists in a folder (``GET /folder/{id}/list``) or directly in a
+    space (``GET /space/{id}/list``).
+
+    Provide ``folder_id`` or ``space_id``. When both are given, ``folder_id``
+    wins.
+    """
+
+    context = _context(tenant_id, user_id, access_token, permissions)
+    with use_tenant_context(context):
+        check_permission(
+            context.tenant_id, context.user_id, "clickup_get_lists", context.permissions
+        )
+        settings = await _resolve_settings()
+        missing = _missing_token(settings)
+        if missing:
+            return _not_configured(missing)
+        if not folder_id and not space_id:
+            return _error(400, "one of folder_id or space_id is required")
+
+        async def _do(service: ClickUpWriteService) -> dict[str, Any]:
+            if folder_id:
+                payload = await service.get_lists_in_folder(folder_id)
+            else:
+                payload = await service.get_lists_in_space(space_id)
+            lists = payload.get("lists", []) if isinstance(payload, dict) else []
+            results = [
+                {
+                    "id": ls.get("id", ""),
+                    "name": ls.get("name", ""),
+                    "task_count": ls.get("task_count"),
+                    "status": ls.get("status"),
+                }
+                for ls in lists
+            ]
+            return _ok(count=len(results), lists=results)
+
+        return await _run(_do, "clickup_get_lists", settings)
+
+
+async def clickup_list_tasks_by_id(
+    list_id: str,
+    limit: int = 20,
+    status: str | None = None,
+    assignee: str | None = None,
+    tenant_id: str | None = None,
+    user_id: str | None = None,
+    access_token: str | None = None,
+    permissions: list[str] | None = None,
+) -> dict[str, Any]:
+    """List tasks in any list by raw ClickUp list id (``GET /list/{id}/task``).
+
+    Config-free general-purpose reader: works with any list the API token can
+    reach, no per-list schema needed. ``status`` filters on the native ClickUp
+    status name; ``assignee`` filters on a ClickUp assignee (user id — ClickUp's
+    ``assignees[]`` filter does not accept usernames). Custom fields are not
+    decoded (see ``clickup_list_tasks`` for schema-aware decoding).
+    """
+
+    context = _context(tenant_id, user_id, access_token, permissions)
+    with use_tenant_context(context):
+        check_permission(
+            context.tenant_id, context.user_id, "clickup_list_tasks_by_id", context.permissions
+        )
+        settings = await _resolve_settings()
+        missing = _missing_token(settings)
+        if missing:
+            return _not_configured(missing)
+        if not list_id:
+            return _error(400, "list_id is required")
+
+        cap = max(1, int(limit))
+        params: dict[str, Any] = {"include_closed": "true", "subtasks": "false"}
+        if status:
+            params["statuses[]"] = status
+        if assignee:
+            params["assignees[]"] = assignee
+
+        async def _do(service: ClickUpWriteService) -> dict[str, Any]:
+            payload = await service.list_tasks_by_id(list_id, params)
+            tasks = payload.get("tasks", []) if isinstance(payload, dict) else []
+            results = [_map_raw_task(t) for t in tasks][:cap]
+            return _ok(list_id=list_id, count=len(results), tasks=results)
+
+        return await _run(_do, "clickup_list_tasks_by_id", settings)
 
 
 # ---------------------------------------------------------------------------
@@ -435,6 +568,8 @@ def register(mcp: Any) -> None:
     mcp.tool()(clickup_get_spaces)
     mcp.tool()(clickup_get_folders)
     mcp.tool()(clickup_get_members)
+    mcp.tool()(clickup_get_lists)
+    mcp.tool()(clickup_list_tasks_by_id)
     mcp.tool()(clickup_create_folder)
     mcp.tool()(clickup_create_list)
     mcp.tool()(clickup_create_space)

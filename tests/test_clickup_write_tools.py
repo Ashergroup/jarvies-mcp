@@ -396,3 +396,164 @@ async def test_create_form_error(monkeypatch: pytest.MonkeyPatch) -> None:
 
     assert result["status"] == "error"
     assert result["code"] == 400
+
+
+# ---------------------------------------------------------------------------
+# 9. clickup_get_lists (dynamic list discovery)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_get_lists_in_folder_happy_path(monkeypatch: pytest.MonkeyPatch) -> None:
+    _set_env(monkeypatch)
+    payload = {
+        "lists": [
+            {"id": "ls1", "name": "Applications", "task_count": "12", "status": None}
+        ]
+    }
+    with respx.mock(assert_all_called=True) as mock:
+        mock.get(f"{BASE}/folder/fd1/list").mock(
+            return_value=httpx.Response(200, json=payload)
+        )
+        result = await cwt.clickup_get_lists(folder_id="fd1", permissions=PERMS)
+
+    assert result["status"] == "ok"
+    assert result["count"] == 1
+    assert result["lists"][0]["id"] == "ls1"
+    assert result["lists"][0]["task_count"] == "12"
+
+
+@pytest.mark.asyncio
+async def test_get_lists_in_space_happy_path(monkeypatch: pytest.MonkeyPatch) -> None:
+    _set_env(monkeypatch)
+    payload = {"lists": [{"id": "ls7", "name": "Folderless", "task_count": "3"}]}
+    with respx.mock(assert_all_called=True) as mock:
+        mock.get(f"{BASE}/space/sp1/list").mock(
+            return_value=httpx.Response(200, json=payload)
+        )
+        result = await cwt.clickup_get_lists(space_id="sp1", permissions=PERMS)
+
+    assert result["status"] == "ok"
+    assert result["lists"][0]["id"] == "ls7"
+
+
+@pytest.mark.asyncio
+async def test_get_lists_prefers_folder_when_both_given(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _set_env(monkeypatch)
+    with respx.mock(assert_all_called=True) as mock:
+        # Only the folder route is registered → asserts the space route is unused.
+        mock.get(f"{BASE}/folder/fd1/list").mock(
+            return_value=httpx.Response(200, json={"lists": [{"id": "ls1", "name": "L"}]})
+        )
+        result = await cwt.clickup_get_lists(
+            folder_id="fd1", space_id="sp1", permissions=PERMS
+        )
+
+    assert result["status"] == "ok"
+    assert result["lists"][0]["id"] == "ls1"
+
+
+@pytest.mark.asyncio
+async def test_get_lists_requires_folder_or_space(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _set_env(monkeypatch)
+    result = await cwt.clickup_get_lists(permissions=PERMS)
+    assert result["status"] == "error"
+    assert result["code"] == 400
+
+
+@pytest.mark.asyncio
+async def test_get_lists_error(monkeypatch: pytest.MonkeyPatch) -> None:
+    _set_env(monkeypatch)
+    with respx.mock(assert_all_called=True) as mock:
+        mock.get(f"{BASE}/folder/fd1/list").mock(
+            return_value=httpx.Response(404, json={"err": "Folder not found"})
+        )
+        result = await cwt.clickup_get_lists(folder_id="fd1", permissions=PERMS)
+
+    assert result["status"] == "error"
+    assert result["code"] == 404
+
+
+# ---------------------------------------------------------------------------
+# 10. clickup_list_tasks_by_id (config-free dynamic task access)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_list_tasks_by_id_happy_path(monkeypatch: pytest.MonkeyPatch) -> None:
+    _set_env(monkeypatch)
+    payload = {
+        "tasks": [
+            {
+                "id": "tk1",
+                "name": "Acme grant",
+                "status": {"status": "ACTIVE"},
+                "assignees": [{"id": 11, "username": "Thandi"}],
+                "due_date": "1735689600000",
+                "priority": {"priority": "high"},
+                "description": "Renewal application",
+            }
+        ]
+    }
+    with respx.mock(assert_all_called=True) as mock:
+        route = mock.get(f"{BASE}/list/anylist123/task").mock(
+            return_value=httpx.Response(200, json=payload)
+        )
+        result = await cwt.clickup_list_tasks_by_id(
+            list_id="anylist123", permissions=PERMS
+        )
+
+    assert result["status"] == "ok"
+    assert result["list_id"] == "anylist123"
+    task = result["tasks"][0]
+    assert task["id"] == "tk1"
+    assert task["status"] == "ACTIVE"
+    assert task["assignee"] == ["Thandi"]
+    assert task["priority"] == "high"
+    assert task["description"] == "Renewal application"
+    # Raw token, NOT Bearer.
+    assert route.calls[0].request.headers["authorization"] == "tok-do-not-log"
+
+
+@pytest.mark.asyncio
+async def test_list_tasks_by_id_applies_limit_and_filters(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _set_env(monkeypatch)
+    payload = {
+        "tasks": [
+            {"id": "tk1", "name": "A", "status": {"status": "OPEN"}},
+            {"id": "tk2", "name": "B", "status": {"status": "OPEN"}},
+            {"id": "tk3", "name": "C", "status": {"status": "OPEN"}},
+        ]
+    }
+    with respx.mock(assert_all_called=True) as mock:
+        route = mock.get(f"{BASE}/list/ls1/task").mock(
+            return_value=httpx.Response(200, json=payload)
+        )
+        result = await cwt.clickup_list_tasks_by_id(
+            list_id="ls1", limit=2, status="OPEN", assignee="11", permissions=PERMS
+        )
+
+    assert result["status"] == "ok"
+    assert result["count"] == 2  # client-side limit applied
+    sent_url = str(route.calls[0].request.url)
+    assert "statuses%5B%5D=OPEN" in sent_url or "statuses[]=OPEN" in sent_url
+    assert "assignees%5B%5D=11" in sent_url or "assignees[]=11" in sent_url
+
+
+@pytest.mark.asyncio
+async def test_list_tasks_by_id_error(monkeypatch: pytest.MonkeyPatch) -> None:
+    _set_env(monkeypatch)
+    with respx.mock(assert_all_called=True) as mock:
+        mock.get(f"{BASE}/list/ls1/task").mock(
+            return_value=httpx.Response(404, json={"err": "List not found"})
+        )
+        result = await cwt.clickup_list_tasks_by_id(list_id="ls1", permissions=PERMS)
+
+    assert result["status"] == "error"
+    assert result["code"] == 404
