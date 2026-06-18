@@ -95,6 +95,24 @@ TOOL_POLICIES: dict[str, ToolPolicy] = {
     "clickup_reopen_subtask": ToolPolicy(
         required_any={"fundraising_access"}, write=True
     ),
+    "clickup_get_spaces": ToolPolicy(required_any={"fundraising_access"}),
+    "clickup_get_folders": ToolPolicy(required_any={"fundraising_access"}),
+    "clickup_get_members": ToolPolicy(required_any={"fundraising_access"}),
+    "clickup_create_folder": ToolPolicy(
+        required_any={"fundraising_access"}, write=True
+    ),
+    "clickup_create_list": ToolPolicy(
+        required_any={"fundraising_access"}, write=True
+    ),
+    "clickup_create_space": ToolPolicy(
+        required_any={"fundraising_access"}, write=True
+    ),
+    "clickup_delete_task": ToolPolicy(
+        required_any={"fundraising_access"}, write=True
+    ),
+    "clickup_create_form": ToolPolicy(
+        required_any={"fundraising_access"}, write=True
+    ),
 }
 
 
