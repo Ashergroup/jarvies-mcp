@@ -88,6 +88,22 @@ DDL_STATEMENTS = [
         UNIQUE(tenant_id, credential_type)
     )
     """,
+    # Admin-consent onboarding (#8). Mirrors
+    # agents.mcp.admin_consent.CONSENT_DDL_STATEMENTS, which also applies these
+    # idempotently at server startup. Kept inline here so this script stays
+    # standalone (no agents.* import).
+    """
+    CREATE TABLE IF NOT EXISTS oauth_states (
+        state TEXT PRIMARY KEY,
+        tenant_hint TEXT,
+        plan TEXT DEFAULT 'standard',
+        created_at TIMESTAMPTZ DEFAULT NOW(),
+        expires_at TIMESTAMPTZ NOT NULL
+    )
+    """,
+    "ALTER TABLE tenants ADD COLUMN IF NOT EXISTS plan TEXT",
+    "ALTER TABLE tenants ADD COLUMN IF NOT EXISTS consented_at TIMESTAMPTZ",
+    "ALTER TABLE tenants ADD COLUMN IF NOT EXISTS status TEXT DEFAULT 'active'",
 ]
 
 

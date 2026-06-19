@@ -293,6 +293,15 @@ async def authorize(request: Request) -> Response:
 
 
 async def auth_callback(request: Request) -> Response:
+    # Microsoft admin-consent responses (no `code`) are handled here first; the
+    # handler returns None for the user OAuth flow (which carries `code`), so
+    # the existing flow below runs completely unchanged.
+    from agents.mcp import admin_consent
+
+    consent_response = await admin_consent.handle_admin_consent(request)
+    if consent_response is not None:
+        return consent_response
+
     params = request.query_params
     code = params.get("code")
     state = params.get("state")

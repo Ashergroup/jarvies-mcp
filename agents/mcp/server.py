@@ -14,6 +14,7 @@ from starlette.responses import JSONResponse
 from starlette.routing import Route
 
 from agents.mcp.admin import register_admin_routes
+from agents.mcp.admin_consent import ensure_consent_schema, register_consent_routes
 from agents.mcp.auth import MCPAuthMiddleware, log_production_safety_warnings
 from agents.mcp.config import get_settings
 from agents.mcp.database import close_pool, init_pool
@@ -115,6 +116,8 @@ async def _lifespan(app_: Any) -> AsyncIterator[None]:
     if settings.database_url:
         try:
             await init_pool()
+            # Idempotent admin-consent schema (oauth_states + tenants columns).
+            await ensure_consent_schema()
         except Exception:
             log.exception("db_pool_init_failed_continuing")
     else:
@@ -153,5 +156,10 @@ register_oauth_routes(app)
 # Admin tenant-credential endpoints (/admin/*). These enforce their own
 # X-API-Key (JARVIES_ADMIN_API_KEY) and are skipped by MCPAuthMiddleware.
 register_admin_routes(app)
+
+# Microsoft admin-consent onboarding (/auth/start, /auth/tenants). Bypassed by
+# MCPAuthMiddleware (see auth.CONSENT_PUBLIC_PATHS); /auth/callback is already
+# registered by register_oauth_routes and stays public.
+register_consent_routes(app)
 
 log.info("mcp_server_ready", extra={"endpoint": "/mcp"})
