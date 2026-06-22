@@ -10,6 +10,9 @@ from agents.mcp.tools import m365_mail_folder_tools as mft
 GRAPH = "https://graph.microsoft.com/v1.0"
 PERMS = ["m365_access"]
 TOKEN = "fake-graph-token-do-not-log"
+# All mailbox Graph calls target /users/{upn}/... — never /me/.
+UPN = "user@nichegroup.africa"
+USERS = f"/users/{UPN}"
 
 
 @pytest.fixture(autouse=True)
@@ -19,15 +22,26 @@ def _clear_settings_cache() -> None:
     mcp_config.get_settings.cache_clear()
 
 
+@pytest.fixture
+def upn(monkeypatch: pytest.MonkeyPatch) -> str:
+    """Make `_get_upn` resolve a known UPN so calls target /users/{upn}/...."""
+
+    async def fake_upn(user_id: str | None = None) -> str:
+        return UPN
+
+    monkeypatch.setattr(mft, "_get_upn", fake_upn)
+    return UPN
+
+
 # ---------------------------------------------------------------------------
 # m365_list_mail_folders
 # ---------------------------------------------------------------------------
 
 
 @pytest.mark.asyncio
-async def test_list_mail_folders_happy_path() -> None:
+async def test_list_mail_folders_happy_path(upn: str) -> None:
     with respx.mock(assert_all_called=True) as mock:
-        route = mock.get(f"{GRAPH}/me/mailFolders").mock(
+        route = mock.get(f"{GRAPH}{USERS}/mailFolders").mock(
             return_value=httpx.Response(
                 200,
                 json={
@@ -53,9 +67,9 @@ async def test_list_mail_folders_happy_path() -> None:
 
 
 @pytest.mark.asyncio
-async def test_list_mail_folders_error_on_403() -> None:
+async def test_list_mail_folders_error_on_403(upn: str) -> None:
     with respx.mock(assert_all_called=True) as mock:
-        mock.get(f"{GRAPH}/me/mailFolders").mock(
+        mock.get(f"{GRAPH}{USERS}/mailFolders").mock(
             return_value=httpx.Response(403, json={"error": "forbidden"})
         )
         result = await mft.m365_list_mail_folders(access_token=TOKEN, permissions=PERMS)
@@ -70,9 +84,9 @@ async def test_list_mail_folders_error_on_403() -> None:
 
 
 @pytest.mark.asyncio
-async def test_create_mail_folder_happy_path() -> None:
+async def test_create_mail_folder_happy_path(upn: str) -> None:
     with respx.mock(assert_all_called=True) as mock:
-        route = mock.post(f"{GRAPH}/me/mailFolders").mock(
+        route = mock.post(f"{GRAPH}{USERS}/mailFolders").mock(
             return_value=httpx.Response(
                 201, json={"id": "newf", "displayName": "Clients"}
             )
@@ -89,9 +103,9 @@ async def test_create_mail_folder_happy_path() -> None:
 
 
 @pytest.mark.asyncio
-async def test_create_mail_folder_subfolder_uses_child_path() -> None:
+async def test_create_mail_folder_subfolder_uses_child_path(upn: str) -> None:
     with respx.mock(assert_all_called=True) as mock:
-        route = mock.post(f"{GRAPH}/me/mailFolders/parent1/childFolders").mock(
+        route = mock.post(f"{GRAPH}{USERS}/mailFolders/parent1/childFolders").mock(
             return_value=httpx.Response(
                 201, json={"id": "childf", "displayName": "Sub"}
             )
@@ -109,9 +123,9 @@ async def test_create_mail_folder_subfolder_uses_child_path() -> None:
 
 
 @pytest.mark.asyncio
-async def test_create_mail_folder_error_on_400() -> None:
+async def test_create_mail_folder_error_on_400(upn: str) -> None:
     with respx.mock(assert_all_called=True) as mock:
-        mock.post(f"{GRAPH}/me/mailFolders").mock(
+        mock.post(f"{GRAPH}{USERS}/mailFolders").mock(
             return_value=httpx.Response(400, json={"error": "bad"})
         )
         result = await mft.m365_create_mail_folder(
@@ -128,9 +142,9 @@ async def test_create_mail_folder_error_on_400() -> None:
 
 
 @pytest.mark.asyncio
-async def test_move_email_happy_path() -> None:
+async def test_move_email_happy_path(upn: str) -> None:
     with respx.mock(assert_all_called=True) as mock:
-        route = mock.post(f"{GRAPH}/me/messages/msg1/move").mock(
+        route = mock.post(f"{GRAPH}{USERS}/messages/msg1/move").mock(
             return_value=httpx.Response(201, json={"id": "msg1-moved"})
         )
         result = await mft.m365_move_email(
@@ -160,9 +174,9 @@ async def test_move_email_rejects_bad_uri() -> None:
 
 
 @pytest.mark.asyncio
-async def test_move_email_error_on_404() -> None:
+async def test_move_email_error_on_404(upn: str) -> None:
     with respx.mock(assert_all_called=True) as mock:
-        mock.post(f"{GRAPH}/me/messages/msg1/move").mock(
+        mock.post(f"{GRAPH}{USERS}/messages/msg1/move").mock(
             return_value=httpx.Response(404, json={"error": "not found"})
         )
         result = await mft.m365_move_email(
@@ -244,9 +258,9 @@ async def test_list_sharepoint_folders_error_on_403() -> None:
 
 
 @pytest.mark.asyncio
-async def test_search_teams_chat_happy_path() -> None:
+async def test_search_teams_chat_happy_path(upn: str) -> None:
     with respx.mock(assert_all_called=True) as mock:
-        mock.get(f"{GRAPH}/me/chats").mock(
+        mock.get(f"{GRAPH}{USERS}/chats").mock(
             return_value=httpx.Response(200, json={"value": [{"id": "chat1"}]})
         )
         mock.get(f"{GRAPH}/chats/chat1/messages").mock(
@@ -285,9 +299,9 @@ async def test_search_teams_chat_happy_path() -> None:
 
 
 @pytest.mark.asyncio
-async def test_search_teams_chat_error_on_403() -> None:
+async def test_search_teams_chat_error_on_403(upn: str) -> None:
     with respx.mock(assert_all_called=True) as mock:
-        mock.get(f"{GRAPH}/me/chats").mock(
+        mock.get(f"{GRAPH}{USERS}/chats").mock(
             return_value=httpx.Response(403, json={"error": "forbidden"})
         )
         result = await mft.m365_search_teams_chat(
@@ -361,3 +375,23 @@ async def test_missing_token_returns_error() -> None:
     result = await mft.m365_list_mail_folders(permissions=PERMS)
     assert result["status"] == "error"
     assert result["error"] == "No M365 access token available — please reconnect via OAuth"
+
+
+@pytest.mark.asyncio
+async def test_falls_back_to_me_when_upn_unavailable(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """When `_get_upn` can't resolve a UPN, calls fall back to /me/."""
+
+    async def no_upn(user_id: str | None = None) -> None:
+        return None
+
+    monkeypatch.setattr(mft, "_get_upn", no_upn)
+    with respx.mock(assert_all_called=True) as mock:
+        route = mock.get(f"{GRAPH}/me/mailFolders").mock(
+            return_value=httpx.Response(200, json={"value": []})
+        )
+        result = await mft.m365_list_mail_folders(access_token=TOKEN, permissions=PERMS)
+
+    assert result["status"] == "ok"
+    assert route.called

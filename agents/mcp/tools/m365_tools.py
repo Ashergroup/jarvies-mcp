@@ -33,7 +33,9 @@ from agents.mcp.tools.m365_write_tools import (
     _context,
     _err,
     _get_m365_token,
+    _get_upn,
     _graph_request,
+    _mailbox_base,
     _ok,
 )
 
@@ -99,7 +101,7 @@ async def m365_search_emails(
     access_token: str | None = None,
     permissions: list[str] | None = None,
 ) -> dict[str, Any]:
-    """Search the signed-in user's Outlook mailbox via `GET /me/messages`.
+    """Search the signed-in user's Outlook mailbox via `GET /users/{upn}/messages`.
 
     Args:
         query: Free-text `$search` across the mailbox.
@@ -150,10 +152,11 @@ async def m365_search_emails(
         if not sender and not query:
             params["$orderby"] = "receivedDateTime desc"
 
+        mbox = _mailbox_base(await _get_upn(context.user_id))
         try:
             data = await _graph_request(
                 "GET",
-                "/me/messages",
+                f"{mbox}/messages",
                 token,
                 params=params,
                 headers=headers_extra or None,
@@ -174,7 +177,7 @@ async def m365_read_email(
     access_token: str | None = None,
     permissions: list[str] | None = None,
 ) -> dict[str, Any]:
-    """Read one email body via `GET /me/messages/{id}`.
+    """Read one email body via `GET /users/{upn}/messages/{id}`.
 
     Args:
         uri: A `mail:///messages/{id}` URI from `m365_search_emails`.
@@ -198,10 +201,11 @@ async def m365_read_email(
             return _err(f"Not an email URI: {uri}")
         msg_id = uri.removeprefix("mail:///messages/")
 
+        mbox = _mailbox_base(await _get_upn(context.user_id))
         try:
             m = await _graph_request(
                 "GET",
-                f"/me/messages/{msg_id}",
+                f"{mbox}/messages/{msg_id}",
                 token,
                 params={"$select": "id,subject,from,receivedDateTime,body"},
             )
@@ -240,9 +244,9 @@ async def m365_search_calendar(
     access_token: str | None = None,
     permissions: list[str] | None = None,
 ) -> dict[str, Any]:
-    """Search the signed-in user's calendar via `GET /me/events`.
+    """Search the signed-in user's calendar via `GET /users/{upn}/events`.
 
-    Graph does not support `$search` on `/me/events`, so a date `$filter` is
+    Graph does not support `$search` on `/users/{upn}/events`, so a date `$filter` is
     applied server-side and `query` is matched client-side on
     subject/location/organizer.
 
@@ -275,8 +279,9 @@ async def m365_search_calendar(
         if filters:
             params["$filter"] = " and ".join(filters)
 
+        mbox = _mailbox_base(await _get_upn(context.user_id))
         try:
-            data = await _graph_request("GET", "/me/events", token, params=params)
+            data = await _graph_request("GET", f"{mbox}/events", token, params=params)
         except httpx.HTTPStatusError as exc:
             return _err(f"Graph search calendar failed: HTTP {exc.response.status_code}")
         except httpx.RequestError as exc:
@@ -391,7 +396,7 @@ async def m365_create_email_draft(
     access_token: str | None = None,
     permissions: list[str] | None = None,
 ) -> dict[str, Any]:
-    """Create an Outlook draft via `POST /me/messages`. Never sends.
+    """Create an Outlook draft via `POST /users/{upn}/messages`. Never sends.
 
     The message lands in the Drafts folder; sending is a separate action
     (`m365_send_email`). Requires the delegated `Mail.ReadWrite` scope.
@@ -434,8 +439,11 @@ async def m365_create_email_draft(
                 {"name": "x-in-reply-to-uri", "value": in_reply_to_uri}
             ]
 
+        mbox = _mailbox_base(await _get_upn(context.user_id))
         try:
-            created = await _graph_request("POST", "/me/messages", token, json=message)
+            created = await _graph_request(
+                "POST", f"{mbox}/messages", token, json=message
+            )
         except httpx.HTTPStatusError as exc:
             return _err(f"Graph create draft failed: HTTP {exc.response.status_code}")
         except httpx.RequestError as exc:

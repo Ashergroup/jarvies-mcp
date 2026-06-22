@@ -47,7 +47,9 @@ from agents.mcp.tools.m365_write_tools import (
     _encode_share_url,
     _err,
     _get_m365_token,
+    _get_upn,
     _graph_request,
+    _mailbox_base,
     _ok,
 )
 
@@ -73,7 +75,7 @@ async def m365_list_mail_folders(
     access_token: str | None = None,
     permissions: list[str] | None = None,
 ) -> dict[str, Any]:
-    """List the signed-in user's mail folders via `GET /me/mailFolders`.
+    """List the signed-in user's mail folders via `GET /users/{upn}/mailFolders`.
 
     Requires the delegated `Mail.ReadWrite` scope.
 
@@ -93,9 +95,10 @@ async def m365_list_mail_folders(
         if not token:
             return _err(_NO_TOKEN_MESSAGE)
 
+        mbox = _mailbox_base(await _get_upn(context.user_id))
         try:
             data = await _graph_request(
-                "GET", "/me/mailFolders", token, params={"$top": 50}
+                "GET", f"{mbox}/mailFolders", token, params={"$top": 50}
             )
         except httpx.HTTPStatusError as exc:
             return _err(f"Graph list mail folders failed: HTTP {exc.response.status_code}")
@@ -114,14 +117,14 @@ async def m365_create_mail_folder(
     access_token: str | None = None,
     permissions: list[str] | None = None,
 ) -> dict[str, Any]:
-    """Create a mail folder via `POST /me/mailFolders`.
+    """Create a mail folder via `POST /users/{upn}/mailFolders`.
 
     Requires the delegated `Mail.ReadWrite` scope.
 
     Args:
         folder_name: Display name for the new folder.
         parent_folder_id: Optional parent folder id. When given, the folder is
-            created as a subfolder via `/me/mailFolders/{id}/childFolders`.
+            created as a subfolder via `/users/{upn}/mailFolders/{id}/childFolders`.
 
     Returns:
         `{"status": "ok", "data": {"id", "displayName", "parent_folder_id"}}`
@@ -141,10 +144,11 @@ async def m365_create_mail_folder(
         if not folder_name:
             return _err("folder_name is required")
 
+        mbox = _mailbox_base(await _get_upn(context.user_id))
         path = (
-            f"/me/mailFolders/{parent_folder_id}/childFolders"
+            f"{mbox}/mailFolders/{parent_folder_id}/childFolders"
             if parent_folder_id
-            else "/me/mailFolders"
+            else f"{mbox}/mailFolders"
         )
         payload = {"displayName": folder_name}
 
@@ -172,7 +176,7 @@ async def m365_move_email(
     access_token: str | None = None,
     permissions: list[str] | None = None,
 ) -> dict[str, Any]:
-    """Move an email to another folder via `POST /me/messages/{id}/move`.
+    """Move an email to another folder via `POST /users/{upn}/messages/{id}/move`.
 
     Requires the delegated `Mail.ReadWrite` scope. The move creates a copy in
     the destination folder and returns a new message id.
@@ -203,10 +207,11 @@ async def m365_move_email(
             return _err("destination_folder_id is required")
         msg_id = message_uri.removeprefix("mail:///messages/")
 
+        mbox = _mailbox_base(await _get_upn(context.user_id))
         try:
             moved = await _graph_request(
                 "POST",
-                f"/me/messages/{msg_id}/move",
+                f"{mbox}/messages/{msg_id}/move",
                 token,
                 json={"destinationId": destination_folder_id},
             )
@@ -297,7 +302,7 @@ async def m365_search_teams_chat(
     """Search the signed-in user's Teams chat messages for `query`.
 
     Requires the delegated `Chat.Read` scope. Lists the user's chats via
-    `GET /me/chats?$expand=members`, then reads each chat's messages via
+    `GET /users/{upn}/chats?$expand=members`, then reads each chat's messages via
     `GET /chats/{id}/messages`.
 
     Graph limitation: `/chats/{id}/messages` does not support `$search` on
@@ -328,9 +333,10 @@ async def m365_search_teams_chat(
         size = max(1, int(limit))
         needle = query.lower()
 
+        mbox = _mailbox_base(await _get_upn(context.user_id))
         try:
             chats_data = await _graph_request(
-                "GET", "/me/chats", token, params={"$expand": "members"}
+                "GET", f"{mbox}/chats", token, params={"$expand": "members"}
             )
             results: list[dict[str, Any]] = []
             for chat in chats_data.get("value", [])[:_MAX_CHATS_SCANNED]:

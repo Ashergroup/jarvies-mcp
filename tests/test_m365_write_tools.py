@@ -15,6 +15,9 @@ GRAPH = "https://graph.microsoft.com/v1.0"
 PERMS = ["m365_access"]
 TOKEN = "fake-graph-token-do-not-log"
 REAL_USER_ID = "22222222-2222-2222-2222-222222222222"
+# All mailbox Graph calls target /users/{upn}/... — never /me/.
+UPN = "user@nichegroup.africa"
+USERS = f"/users/{UPN}"
 
 # Per-tenant Microsoft token endpoint for the configured AZURE_TENANT_ID below.
 AZURE_TENANT = "azure-tid-test"
@@ -64,15 +67,31 @@ def _clear_settings_cache() -> None:
     mcp_config.get_settings.cache_clear()
 
 
+@pytest.fixture
+def upn(monkeypatch: pytest.MonkeyPatch) -> str:
+    """Make `_get_upn` resolve a known UPN so calls target /users/{upn}/....
+
+    Patched in both the write module and the read module (`m365_tools`), which
+    binds its own `_get_upn` reference at import time.
+    """
+
+    async def fake_upn(user_id: str | None = None) -> str:
+        return UPN
+
+    monkeypatch.setattr(m365_write_tools, "_get_upn", fake_upn)
+    monkeypatch.setattr(m365_tools, "_get_upn", fake_upn)
+    return UPN
+
+
 # ---------------------------------------------------------------------------
 # m365_send_email
 # ---------------------------------------------------------------------------
 
 
 @pytest.mark.asyncio
-async def test_send_email_happy_path() -> None:
+async def test_send_email_happy_path(upn: str) -> None:
     with respx.mock(assert_all_called=True) as mock:
-        route = mock.post(f"{GRAPH}/me/sendMail").mock(
+        route = mock.post(f"{GRAPH}{USERS}/sendMail").mock(
             return_value=httpx.Response(202)
         )
         result = await m365_write_tools.m365_send_email(
@@ -92,9 +111,9 @@ async def test_send_email_happy_path() -> None:
 
 
 @pytest.mark.asyncio
-async def test_send_email_error_on_403() -> None:
+async def test_send_email_error_on_403(upn: str) -> None:
     with respx.mock(assert_all_called=True) as mock:
-        mock.post(f"{GRAPH}/me/sendMail").mock(
+        mock.post(f"{GRAPH}{USERS}/sendMail").mock(
             return_value=httpx.Response(403, json={"error": "forbidden"})
         )
         result = await m365_write_tools.m365_send_email(
@@ -115,9 +134,9 @@ async def test_send_email_error_on_403() -> None:
 
 
 @pytest.mark.asyncio
-async def test_create_calendar_event_happy_path() -> None:
+async def test_create_calendar_event_happy_path(upn: str) -> None:
     with respx.mock(assert_all_called=True) as mock:
-        route = mock.post(f"{GRAPH}/me/events").mock(
+        route = mock.post(f"{GRAPH}{USERS}/events").mock(
             return_value=httpx.Response(
                 201, json={"id": "evt1", "webLink": "https://outlook/evt1"}
             )
@@ -141,9 +160,9 @@ async def test_create_calendar_event_happy_path() -> None:
 
 
 @pytest.mark.asyncio
-async def test_create_calendar_event_error_on_400() -> None:
+async def test_create_calendar_event_error_on_400(upn: str) -> None:
     with respx.mock(assert_all_called=True) as mock:
-        mock.post(f"{GRAPH}/me/events").mock(
+        mock.post(f"{GRAPH}{USERS}/events").mock(
             return_value=httpx.Response(400, json={"error": "bad request"})
         )
         result = await m365_write_tools.m365_create_calendar_event(
@@ -394,13 +413,15 @@ async def test_get_m365_token_none_when_no_identity() -> None:
 
 
 @pytest.mark.asyncio
-async def test_send_email_uses_stored_token(monkeypatch: pytest.MonkeyPatch) -> None:
+async def test_send_email_uses_stored_token(
+    monkeypatch: pytest.MonkeyPatch, upn: str
+) -> None:
     async def fake_lookup(user_id: str) -> str:
         return "stored-graph-token"
 
     monkeypatch.setattr(m365_write_tools, "_lookup_user_token", fake_lookup)
     with respx.mock(assert_all_called=True) as mock:
-        route = mock.post(f"{GRAPH}/me/sendMail").mock(
+        route = mock.post(f"{GRAPH}{USERS}/sendMail").mock(
             return_value=httpx.Response(202)
         )
         result = await m365_write_tools.m365_send_email(
@@ -416,13 +437,15 @@ async def test_send_email_uses_stored_token(monkeypatch: pytest.MonkeyPatch) -> 
 
 
 @pytest.mark.asyncio
-async def test_read_tool_uses_stored_token(monkeypatch: pytest.MonkeyPatch) -> None:
+async def test_read_tool_uses_stored_token(
+    monkeypatch: pytest.MonkeyPatch, upn: str
+) -> None:
     async def fake_lookup(user_id: str) -> str:
         return "stored-graph-token"
 
     monkeypatch.setattr(m365_write_tools, "_lookup_user_token", fake_lookup)
     with respx.mock(assert_all_called=True) as mock:
-        route = mock.get(f"{GRAPH}/me/messages").mock(
+        route = mock.get(f"{GRAPH}{USERS}/messages").mock(
             return_value=httpx.Response(200, json={"value": []})
         )
         result = await m365_tools.m365_search_emails(
@@ -436,10 +459,12 @@ async def test_read_tool_uses_stored_token(monkeypatch: pytest.MonkeyPatch) -> N
 
 
 @pytest.mark.asyncio
-async def test_token_not_in_logs(caplog: pytest.LogCaptureFixture) -> None:
+async def test_token_not_in_logs(
+    caplog: pytest.LogCaptureFixture, upn: str
+) -> None:
     caplog.set_level(logging.DEBUG, logger="agents.mcp.tools.m365_write_tools")
     with respx.mock(assert_all_called=True) as mock:
-        mock.post(f"{GRAPH}/me/sendMail").mock(return_value=httpx.Response(202))
+        mock.post(f"{GRAPH}{USERS}/sendMail").mock(return_value=httpx.Response(202))
         await m365_write_tools.m365_send_email(
             to=["a@nichegroup.africa"],
             subject="s",
@@ -606,7 +631,9 @@ async def test_persist_refreshed_token_swallows_db_error(
 
 
 @pytest.mark.asyncio
-async def test_send_email_retries_once_on_401(monkeypatch: pytest.MonkeyPatch) -> None:
+async def test_send_email_retries_once_on_401(
+    monkeypatch: pytest.MonkeyPatch, upn: str
+) -> None:
     _set_azure_env(monkeypatch)
     fresh = datetime.now(UTC) + timedelta(hours=1)
 
@@ -623,7 +650,7 @@ async def test_send_email_retries_once_on_401(monkeypatch: pytest.MonkeyPatch) -
         mock.post(TOKEN_URL).mock(
             return_value=httpx.Response(200, json={"access_token": "new-access"})
         )
-        mail = mock.post(f"{GRAPH}/me/sendMail").mock(
+        mail = mock.post(f"{GRAPH}{USERS}/sendMail").mock(
             side_effect=[
                 httpx.Response(401, json={"error": "InvalidAuthenticationToken"}),
                 httpx.Response(202),
@@ -646,7 +673,7 @@ async def test_send_email_retries_once_on_401(monkeypatch: pytest.MonkeyPatch) -
 
 @pytest.mark.asyncio
 async def test_send_email_stops_after_one_retry_on_repeated_401(
-    monkeypatch: pytest.MonkeyPatch,
+    monkeypatch: pytest.MonkeyPatch, upn: str
 ) -> None:
     _set_azure_env(monkeypatch)
     fresh = datetime.now(UTC) + timedelta(hours=1)
@@ -664,7 +691,7 @@ async def test_send_email_stops_after_one_retry_on_repeated_401(
         mock.post(TOKEN_URL).mock(
             return_value=httpx.Response(200, json={"access_token": "new-access"})
         )
-        mail = mock.post(f"{GRAPH}/me/sendMail").mock(
+        mail = mock.post(f"{GRAPH}{USERS}/sendMail").mock(
             return_value=httpx.Response(401, json={"error": "InvalidAuthenticationToken"})
         )
         result = await m365_write_tools.m365_send_email(
@@ -679,3 +706,115 @@ async def test_send_email_stops_after_one_retry_on_repeated_401(
     assert "401" in (result["error"] or "")
     # Original call + exactly one retry — never loops.
     assert mail.call_count == 2
+
+
+# ---------------------------------------------------------------------------
+# _get_upn helper — UPN resolution from the users table (#8B)
+# ---------------------------------------------------------------------------
+
+
+class _FakeRowConn:
+    def __init__(self, row: dict | None) -> None:
+        self._row = row
+
+    async def fetchrow(self, query: str, *args) -> dict | None:
+        assert "SELECT email FROM users" in query
+        return self._row
+
+
+class _FakeRowConnCtx:
+    def __init__(self, row: dict | None) -> None:
+        self._row = row
+
+    async def __aenter__(self) -> _FakeRowConn:
+        return _FakeRowConn(self._row)
+
+    async def __aexit__(self, *exc) -> bool:
+        return False
+
+
+@pytest.mark.asyncio
+async def test_get_upn_returns_email_from_context(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        m365_write_tools, "get_conn", lambda: _FakeRowConnCtx({"email": UPN})
+    )
+    token = mcp_tenant.set_current_user_id(REAL_USER_ID)
+    try:
+        result = await m365_write_tools._get_upn("local-user")
+    finally:
+        mcp_tenant.reset_current_user_id(token)
+    assert result == UPN
+
+
+@pytest.mark.asyncio
+async def test_get_upn_uses_explicit_non_default_user_id(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        m365_write_tools, "get_conn", lambda: _FakeRowConnCtx({"email": UPN})
+    )
+    result = await m365_write_tools._get_upn(REAL_USER_ID)
+    assert result == UPN
+
+
+@pytest.mark.asyncio
+async def test_get_upn_none_and_warns_when_not_found(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    monkeypatch.setattr(
+        m365_write_tools, "get_conn", lambda: _FakeRowConnCtx(None)
+    )
+    caplog.set_level(logging.WARNING, logger="agents.mcp.tools.m365_write_tools")
+    result = await m365_write_tools._get_upn(REAL_USER_ID)
+    assert result is None
+    assert any("falling back to /me/" in r.getMessage() for r in caplog.records)
+
+
+@pytest.mark.asyncio
+async def test_get_upn_none_and_warns_when_no_identity(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    # Default placeholder user, no auth context → no DB lookup, /me/ fallback.
+    caplog.set_level(logging.WARNING, logger="agents.mcp.tools.m365_write_tools")
+    result = await m365_write_tools._get_upn("local-user")
+    assert result is None
+    assert any("falling back to /me/" in r.getMessage() for r in caplog.records)
+
+
+@pytest.mark.asyncio
+async def test_get_upn_none_and_warns_on_db_error(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    def boom():
+        raise RuntimeError("db down")
+
+    monkeypatch.setattr(m365_write_tools, "get_conn", boom)
+    caplog.set_level(logging.WARNING, logger="agents.mcp.tools.m365_write_tools")
+    result = await m365_write_tools._get_upn(REAL_USER_ID)
+    assert result is None
+    assert any("falling back to /me/" in r.getMessage() for r in caplog.records)
+
+
+@pytest.mark.asyncio
+async def test_no_me_in_graph_url_when_upn_available(upn: str) -> None:
+    """When a UPN resolves, no Graph URL may contain /me/ — it must use /users/."""
+
+    with respx.mock(assert_all_called=True) as mock:
+        send = mock.post(f"{GRAPH}{USERS}/sendMail").mock(
+            return_value=httpx.Response(202)
+        )
+        result = await m365_write_tools.m365_send_email(
+            to=["a@nichegroup.africa"],
+            subject="s",
+            body="b",
+            user_id=REAL_USER_ID,
+            access_token=TOKEN,
+            permissions=PERMS,
+        )
+
+    assert result["status"] == "ok"
+    requested = str(send.calls[0].request.url)
+    assert f"{USERS}/sendMail" in requested
+    assert "/me/" not in requested

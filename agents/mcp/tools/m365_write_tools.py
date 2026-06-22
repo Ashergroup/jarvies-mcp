@@ -302,6 +302,54 @@ async def _get_m365_token(
     return await _lookup_user_token(effective_user_id)
 
 
+async def _get_upn(user_id: str | None) -> str | None:
+    """Resolve the signed-in user's UPN (email) for `/users/{upn}/...` paths.
+
+    Every M365 mailbox/calendar/chat Graph call must target `/users/{upn}/...`
+    rather than `/me/...` so each tool resolves the *same* mailbox object.
+    Mixing the two draws message ids and folder ids from different mailbox
+    contexts, which are not interchangeable — e.g. `m365_move_email` fails
+    because a message id from `m365_search_emails` and a folder id from
+    `m365_list_mail_folders` came from different mailbox contexts.
+
+    The user is resolved the same way as ``_get_m365_token``: the request's
+    bearer-token identity (``tenant.current_user_id``), or an explicit
+    non-default ``user_id``. The email is then read from the ``users`` table.
+
+    Returns the email string, or None when no user identity is available, the
+    lookup fails, or the row has no email. A None return is logged as a warning
+    because callers then fall back to `/me/`, which reintroduces the
+    cross-mailbox-context risk this helper exists to remove.
+    """
+
+    effective_user_id = current_user_id()
+    if not effective_user_id and user_id and user_id != get_settings().default_user_id:
+        effective_user_id = user_id
+    if not effective_user_id:
+        log.warning("m365_upn_no_identity — falling back to /me/")
+        return None
+
+    try:
+        async with get_conn() as conn:
+            row = await conn.fetchrow(
+                "SELECT email FROM users WHERE id::text = $1",
+                effective_user_id,
+            )
+    except Exception:
+        log.warning("m365_upn_lookup_failed — falling back to /me/")
+        return None
+    if row is None or not row["email"]:
+        log.warning("m365_upn_not_found — falling back to /me/")
+        return None
+    return row["email"]
+
+
+def _mailbox_base(upn: str | None) -> str:
+    """Build the Graph mailbox base path: `/users/{upn}` or `/me` fallback."""
+
+    return f"/users/{upn}" if upn else "/me"
+
+
 async def _retry_on_401(context: Any, token: str, attempt: Any) -> Any:
     """Run ``attempt(token)``; on a Graph 401 refresh the token and retry once.
 
@@ -422,7 +470,7 @@ async def m365_send_email(
     access_token: str | None = None,
     permissions: list[str] | None = None,
 ) -> dict[str, Any]:
-    """Send an email via Microsoft Graph `POST /me/sendMail`.
+    """Send an email via Microsoft Graph `POST /users/{upn}/sendMail`.
 
     Unlike `m365_create_email_draft`, this delivers the message immediately
     and saves a copy to Sent Items. Requires the delegated `Mail.Send` scope.
@@ -433,7 +481,7 @@ async def m365_send_email(
         body: Plain-text body.
         cc: Optional list of CC recipients.
         in_reply_to_uri: Optional `mail:///messages/{id}` URI of the message
-            this is a reply to. `/me/sendMail` does not thread natively, so the
+            this is a reply to. `sendMail` does not thread natively, so the
             value is recorded on the sent message as the custom internet header
             `x-in-reply-to-uri` for traceability.
 
@@ -468,8 +516,10 @@ async def m365_send_email(
             ]
         payload = {"message": message, "saveToSentItems": True}
 
+        mbox = _mailbox_base(await _get_upn(context.user_id))
+
         async def _attempt(tok: str) -> dict[str, Any]:
-            return await _graph_request("POST", "/me/sendMail", tok, json=payload)
+            return await _graph_request("POST", f"{mbox}/sendMail", tok, json=payload)
 
         try:
             await _retry_on_401(context, token, _attempt)
@@ -493,7 +543,7 @@ async def m365_create_calendar_event(
     access_token: str | None = None,
     permissions: list[str] | None = None,
 ) -> dict[str, Any]:
-    """Create a calendar event via Microsoft Graph `POST /me/events`.
+    """Create a calendar event via Microsoft Graph `POST /users/{upn}/events`.
 
     Requires the delegated `Calendars.ReadWrite` scope.
 
@@ -543,8 +593,10 @@ async def m365_create_calendar_event(
             event["isOnlineMeeting"] = True
             event["onlineMeetingProvider"] = "teamsForBusiness"
 
+        mbox = _mailbox_base(await _get_upn(context.user_id))
+
         async def _attempt(tok: str) -> dict[str, Any]:
-            return await _graph_request("POST", "/me/events", tok, json=event)
+            return await _graph_request("POST", f"{mbox}/events", tok, json=event)
 
         try:
             created = await _retry_on_401(context, token, _attempt)

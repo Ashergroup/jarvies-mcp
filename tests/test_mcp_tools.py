@@ -8,6 +8,20 @@ from agents.mcp.permissions import MCPPermissionError, check_permission
 from agents.mcp.tools import db_tools, m365_tools, xero_tools
 
 GRAPH = "https://graph.microsoft.com/v1.0"
+# Mailbox Graph calls target /users/{upn}/... — never /me/.
+UPN = "user@nichegroup.africa"
+USERS = f"/users/{UPN}"
+
+
+@pytest.fixture
+def upn(monkeypatch: pytest.MonkeyPatch) -> str:
+    """Make `_get_upn` resolve a known UPN so calls target /users/{upn}/...."""
+
+    async def fake_upn(user_id: str | None = None) -> str:
+        return UPN
+
+    monkeypatch.setattr(m365_tools, "_get_upn", fake_upn)
+    return UPN
 
 
 def test_permission_allows_m365_read() -> None:
@@ -46,9 +60,9 @@ def test_database_validation_allows_select() -> None:
 
 
 @pytest.mark.asyncio
-async def test_m365_search_emails_calls_graph_directly() -> None:
+async def test_m365_search_emails_calls_graph_directly(upn: str) -> None:
     with respx.mock(assert_all_called=True) as mock:
-        route = mock.get(f"{GRAPH}/me/messages").mock(
+        route = mock.get(f"{GRAPH}{USERS}/messages").mock(
             return_value=httpx.Response(
                 200,
                 json={
@@ -87,9 +101,9 @@ async def test_m365_search_emails_calls_graph_directly() -> None:
 
 
 @pytest.mark.asyncio
-async def test_m365_search_emails_error_on_403() -> None:
+async def test_m365_search_emails_error_on_403(upn: str) -> None:
     with respx.mock(assert_all_called=True) as mock:
-        mock.get(f"{GRAPH}/me/messages").mock(
+        mock.get(f"{GRAPH}{USERS}/messages").mock(
             return_value=httpx.Response(403, json={"error": "forbidden"})
         )
         result = await m365_tools.m365_search_emails(
