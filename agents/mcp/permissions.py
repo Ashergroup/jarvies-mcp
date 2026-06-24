@@ -58,6 +58,30 @@ TOOL_POLICIES: dict[str, ToolPolicy] = {
     "freshsales_get_accounts": ToolPolicy(required_any={"freshsales_access"}),
     "freshsales_get_deals": ToolPolicy(required_any={"freshsales_access"}),
     "freshsales_search": ToolPolicy(required_any={"freshsales_access"}),
+    "freshsales_create_contact": ToolPolicy(
+        required_any={"fundraising_access"}, write=True
+    ),
+    "freshsales_update_contact": ToolPolicy(
+        required_any={"fundraising_access"}, write=True
+    ),
+    "freshsales_create_deal": ToolPolicy(
+        required_any={"fundraising_access"}, write=True
+    ),
+    "freshsales_update_deal": ToolPolicy(
+        required_any={"fundraising_access"}, write=True
+    ),
+    "freshsales_create_account": ToolPolicy(
+        required_any={"fundraising_access"}, write=True
+    ),
+    "freshsales_create_note": ToolPolicy(
+        required_any={"fundraising_access"}, write=True
+    ),
+    "freshsales_create_task": ToolPolicy(
+        required_any={"fundraising_access"}, write=True
+    ),
+    "freshsales_get_deal_stages": ToolPolicy(required_any={"fundraising_access"}),
+    "freshsales_get_contact_journey": ToolPolicy(required_any={"fundraising_access"}),
+    "freshsales_search_contacts": ToolPolicy(required_any={"fundraising_access"}),
     "powerbi_list_reports": ToolPolicy(required_any={"finance_access"}),
     "powerbi_get_report": ToolPolicy(required_any={"finance_access"}),
     "powerbi_run_query": ToolPolicy(required_any={"finance_access"}),

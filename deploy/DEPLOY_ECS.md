@@ -58,6 +58,15 @@ aws ecr describe-images --repository-name jarvies-mcp --region eu-west-1 \
 The service is missing: `DATABASE_URL`, `AZURE_CLIENT_ID`, `AZURE_CLIENT_SECRET`,
 `AZURE_REDIRECT_URI`, `AZURE_TENANT_ID`, `JARVIES_TOKEN_SECRET`, `JARVIES_PUBLIC_URL`.
 
+> **Freshsales (flagged):** the Freshsales CRM tools (read + the new write/CRM
+> tools) need `FRESHSALES_DOMAIN` and `FRESHSALES_API_KEY`. These are **not** in
+> the ECS task definition today (only present commented-out in
+> `deploy/apprunner.mcp.yaml` and in `.env.example`). Add both as plaintext
+> `environment` entries when the Freshsales integration is in use — or, for
+> tenant-scoped use, store them in the `tenant_credentials` table instead (the
+> tools resolve credentials DB-first). `FRESHSALES_API_KEY` is a secret; prefer
+> the Secrets Manager approach in the optional section at the end.
+
 > **Security recommendation (flagged, not blocking):** `DATABASE_URL`,
 > `AZURE_CLIENT_SECRET`, and `JARVIES_TOKEN_SECRET` are secrets. Plaintext task-def
 > `environment` values are visible to anyone with `ecs:DescribeTaskDefinition`.
