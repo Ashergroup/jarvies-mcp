@@ -15,8 +15,10 @@ from agents.mcp.tools import clickup_tools
 @pytest.fixture(autouse=True)
 def _clear_settings_cache() -> None:
     mcp_config.get_settings.cache_clear()
+    clickup_tools._clear_schema_cache()
     yield
     mcp_config.get_settings.cache_clear()
+    clickup_tools._clear_schema_cache()
 
 
 # ---------------------------------------------------------------------------
@@ -99,6 +101,19 @@ def _write_multi_list_config(path: Path) -> None:
         }
     }
     path.write_text(json.dumps(payload), encoding="utf-8")
+    # The schema is normally loaded live from the ClickUp API. The existing
+    # tests don't mock the /list/{id}/field endpoints, so without help every
+    # call would attempt (and fail) a live fetch before falling back to this
+    # file — correct, but it adds latency. Seed the in-memory schema cache with
+    # the same blocks so these tests stay offline and fast. Tests that exercise
+    # the live path or the fallback explicitly clear the cache first.
+    import time as _time
+
+    for block in payload["lists"].values():
+        clickup_tools._schema_cache[block["list_id"]] = (
+            _time.monotonic() + 10_000.0,
+            block,
+        )
 
 
 def _write_legacy_config(path: Path) -> None:
@@ -810,3 +825,149 @@ async def test_create_subtask_unknown_list_key_falls_through(
 
     assert result["status"] == "ok"
     assert result["subtask_id"] == "sub-unknown"
+
+
+# ---------------------------------------------------------------------------
+# 19. Dynamic field schema — loaded live from the ClickUp API (#9C).
+# ---------------------------------------------------------------------------
+
+
+def _mock_list_schema(
+    mock: respx.MockRouter,
+    list_id: str,
+    fields: list[dict],
+    statuses: list[str],
+) -> tuple:
+    """Mock GET /list/{id} (statuses) and GET /list/{id}/field (fields)."""
+
+    meta_route = mock.get(
+        f"https://api.clickup.test/api/v2/list/{list_id}"
+    ).mock(
+        return_value=httpx.Response(
+            200, json={"statuses": [{"status": s} for s in statuses]}
+        )
+    )
+    field_route = mock.get(
+        f"https://api.clickup.test/api/v2/list/{list_id}/field"
+    ).mock(return_value=httpx.Response(200, json={"fields": fields}))
+    return meta_route, field_route
+
+
+async def test_live_schema_exposes_new_dropdown_option(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """A dropdown option added in ClickUp (absent from the static file) is
+    immediately usable because the schema is loaded live from the API."""
+
+    fields_path = tmp_path / "clickup_fields.json"
+    _write_multi_list_config(fields_path)  # static file lacks "BrandNewType"
+    _set_clickup_env(monkeypatch, fields_path)
+    clickup_tools._clear_schema_cache()  # force a live fetch
+
+    ir_fields = [
+        {
+            "id": "fld-ir-ftype",
+            "name": "Funder Type",
+            "type": "drop_down",
+            "type_config": {
+                "options": [
+                    {"id": "opt-found", "name": "Foundation", "orderindex": 0},
+                    {"id": "opt-brandnew", "name": "BrandNewType", "orderindex": 1},
+                ]
+            },
+        }
+    ]
+
+    with respx.mock(assert_all_called=False) as mock:
+        _mock_list_schema(mock, IR_LIST_ID, ir_fields, ["ACTIVE", "DORMANT"])
+        _mock_list_schema(mock, PIPELINE_LIST_ID, [], ["LEAD IDENTIFIED"])
+        set_route = mock.post(
+            "https://api.clickup.test/api/v2/task/tk1/field/fld-ir-ftype"
+        ).mock(return_value=httpx.Response(200, json={}))
+
+        result = await clickup_tools.clickup_update_task_field(
+            task_id="tk1",
+            field_name="Funder Type",
+            value="BrandNewType",
+            list_key="investor_relations",
+            permissions=["fundraising_access"],
+        )
+
+    assert result["status"] == "ok"
+    body = json.loads(set_route.calls[0].request.content.decode())
+    # Live option UUID is sent — the static file never knew this option.
+    assert body["value"] == "opt-brandnew"
+
+
+async def test_falls_back_to_static_config_when_api_unavailable(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """When the live schema fetch fails, the static config file is used."""
+
+    fields_path = tmp_path / "clickup_fields.json"
+    _write_multi_list_config(fields_path)
+    _set_clickup_env(monkeypatch, fields_path)
+    clickup_tools._clear_schema_cache()  # don't use the seeded cache
+
+    with respx.mock(assert_all_called=False) as mock:
+        # Live schema fetch errors out → fall back to the file on disk.
+        mock.get(f"https://api.clickup.test/api/v2/list/{IR_LIST_ID}").mock(
+            return_value=httpx.Response(500, json={"err": "boom"})
+        )
+        set_route = mock.post(
+            "https://api.clickup.test/api/v2/task/tk1/field/fld-ir-ftype"
+        ).mock(return_value=httpx.Response(200, json={}))
+
+        result = await clickup_tools.clickup_update_task_field(
+            task_id="tk1",
+            field_name="Funder Type",
+            value="Foundation",
+            list_key="investor_relations",
+            permissions=["fundraising_access"],
+        )
+
+    assert result["status"] == "ok"
+    body = json.loads(set_route.calls[0].request.content.decode())
+    # opt-found is the UUID recorded in the static file (the fallback).
+    assert body["value"] == "opt-found"
+
+
+async def test_live_schema_is_cached_with_ttl(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """The live schema is cached per list and refreshed only after the TTL."""
+
+    fields_path = tmp_path / "clickup_fields.json"  # not created — live only
+    _set_clickup_env(monkeypatch, fields_path)
+    clickup_tools._clear_schema_cache()
+
+    clock = {"t": 1_000.0}
+    monkeypatch.setattr(clickup_tools.time, "monotonic", lambda: clock["t"])
+
+    with respx.mock(assert_all_called=False) as mock:
+        _, ir_field_route = _mock_list_schema(
+            mock, IR_LIST_ID, [], ["ACTIVE"]
+        )
+        _mock_list_schema(mock, PIPELINE_LIST_ID, [], ["LEAD IDENTIFIED"])
+        mock.get(
+            f"https://api.clickup.test/api/v2/list/{IR_LIST_ID}/task"
+        ).mock(return_value=httpx.Response(200, json={"tasks": []}))
+
+        async def _call() -> dict:
+            return await clickup_tools.clickup_list_tasks(
+                list_key="investor_relations",
+                permissions=["fundraising_access"],
+            )
+
+        first = await _call()
+        assert first["status"] == "ok"
+        assert ir_field_route.call_count == 1
+
+        # Second call within the TTL window — served from cache, no refetch.
+        await _call()
+        assert ir_field_route.call_count == 1
+
+        # Advance the clock past the 5-minute TTL — the schema is refetched.
+        clock["t"] += clickup_tools._SCHEMA_TTL_SECONDS + 1.0
+        await _call()
+        assert ir_field_route.call_count == 2

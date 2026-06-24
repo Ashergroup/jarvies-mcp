@@ -38,6 +38,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import threading
 import time
 from typing import Any
 
@@ -68,6 +69,16 @@ _PROBABILITY_WEIGHTS = {"High": 0.75, "Medium": 0.40, "Low": 0.15}
 _RETRY_MAX_ATTEMPTS = 3
 _RETRY_BASE_DELAY_SECONDS = 0.5
 _COMMENT_RETURN_LIMIT = 20
+
+# Live field-schema cache. The schema (statuses, fields, dropdown options) is
+# fetched from the ClickUp API per list and cached in memory for this TTL so
+# new fields / options added in ClickUp become available without a redeploy or
+# config-file edit. The static config file is only a fallback (see
+# ``_load_config``). Keyed by list_id; values are ``(expiry_monotonic, block)``.
+# Guarded by a threading.Lock so concurrent async tasks / threads stay safe.
+_SCHEMA_TTL_SECONDS = 300.0
+_schema_cache: dict[str, tuple[float, dict[str, Any]]] = {}
+_schema_cache_lock = threading.Lock()
 
 
 # ---------------------------------------------------------------------------
@@ -264,6 +275,14 @@ class ClickUpService:
             return response.json()
 
         raise ClickUpAPIError(429, "ClickUp rate limit exceeded after retries")
+
+    async def get_list_meta(self, list_id: str) -> dict[str, Any]:
+        """GET ``/list/{id}`` — list metadata incl. native statuses."""
+        return await self._request("GET", f"list/{list_id}")
+
+    async def get_list_fields(self, list_id: str) -> dict[str, Any]:
+        """GET ``/list/{id}/field`` — the list's custom-field definitions."""
+        return await self._request("GET", f"list/{list_id}/field")
 
     async def list_tasks(
         self,
@@ -617,16 +636,165 @@ def _error(code: int, message: str) -> dict[str, Any]:
 
 
 def _missing_runtime(settings: MCPSettings) -> list[str]:
+    # The field schema is loaded live from the ClickUp API (with the static
+    # config file as a fallback), so the file is no longer a hard requirement —
+    # only the API token is. When neither the live API nor the fallback file
+    # yields a schema, the per-tool ``config is None`` branch reports the
+    # missing config path.
     missing: list[str] = []
     if not settings.clickup_api_token:
         missing.append("CLICKUP_API_TOKEN")
-    if not settings.clickup_fields_config_path.exists():
-        missing.append(str(settings.clickup_fields_config_path))
     return missing
 
 
-def _load_config(settings: MCPSettings):
-    return ClickUpListsConfig.from_path(settings.clickup_fields_config_path)
+def _api_field_entry(api_field: dict[str, Any]) -> dict[str, Any]:
+    """Project one ClickUp API field into the config ``fields`` entry shape."""
+
+    ftype = api_field.get("type", "")
+    entry: dict[str, Any] = {"uuid": api_field.get("id"), "type": ftype}
+    if ftype in {"drop_down", "labels"}:
+        type_config = api_field.get("type_config") or {}
+        api_options = type_config.get("options") or []
+        entry["options"] = [
+            {
+                "uuid": opt.get("id"),
+                "name": opt.get("name"),
+                "orderindex": opt.get("orderindex", idx),
+            }
+            for idx, opt in enumerate(api_options)
+            if isinstance(opt, dict)
+        ]
+    return entry
+
+
+def _build_block_from_api(
+    list_id: str,
+    meta: dict[str, Any],
+    fields_payload: dict[str, Any],
+) -> dict[str, Any]:
+    """Build a per-list config block from the live ``/list`` + ``/field`` data.
+
+    Mirrors the shape produced by ``scripts/setup_clickup_fields.py`` so the
+    rest of the module (validation, option lookup, UUID resolution) is unchanged.
+    """
+
+    raw_statuses = (meta or {}).get("statuses") or []
+    statuses: list[str] = []
+    for s in raw_statuses:
+        if isinstance(s, dict) and isinstance(s.get("status"), str):
+            statuses.append(s["status"])
+        elif isinstance(s, str):
+            statuses.append(s)
+
+    fields: dict[str, dict[str, Any]] = {}
+    for api_field in (fields_payload or {}).get("fields") or []:
+        if not isinstance(api_field, dict):
+            continue
+        name = api_field.get("name")
+        if not name:
+            continue
+        fields[name] = _api_field_entry(api_field)
+
+    return {"list_id": list_id, "statuses": statuses, "fields": fields}
+
+
+async def _fetch_list_block_cached(
+    service: ClickUpService,
+    list_id: str,
+) -> dict[str, Any] | None:
+    """Return the live config block for ``list_id``, using the TTL cache.
+
+    Returns ``None`` on any API/transport failure so the caller can fall back
+    to the static config file.
+    """
+
+    now = time.monotonic()
+    with _schema_cache_lock:
+        cached = _schema_cache.get(list_id)
+        if cached is not None and cached[0] > now:
+            return cached[1]
+
+    try:
+        meta = await service.get_list_meta(list_id)
+        fields_payload = await service.get_list_fields(list_id)
+    except Exception:  # noqa: BLE001 — any failure means fall back to the file.
+        log.warning("clickup_schema_fetch_failed", extra={"list_id": list_id})
+        return None
+
+    block = _build_block_from_api(list_id, meta, fields_payload)
+    with _schema_cache_lock:
+        _schema_cache[list_id] = (time.monotonic() + _SCHEMA_TTL_SECONDS, block)
+    return block
+
+
+async def _load_config_from_api(
+    settings: MCPSettings,
+    static: "ClickUpListsConfig | None | str",
+) -> "ClickUpListsConfig | None":
+    """Build a live ClickUp config from the API, or ``None`` to fall back.
+
+    List ids come from env first, then the static config's recorded ids. Every
+    configured list must fetch successfully; otherwise we return ``None`` so the
+    caller uses the static file unchanged (preserving prior behaviour exactly).
+    """
+
+    if not settings.clickup_api_token:
+        return None
+
+    static_cfg = static if isinstance(static, ClickUpListsConfig) else None
+    targets: list[tuple[str, str]] = []
+    for key, env_id in (
+        (IR_KEY, settings.clickup_ir_list_id),
+        (PIPELINE_KEY, settings.clickup_pipeline_list_id),
+    ):
+        list_id = env_id
+        if not list_id and static_cfg is not None:
+            block = static_cfg.get(key)
+            list_id = block.list_id if block else ""
+        if list_id:
+            targets.append((key, list_id))
+
+    if not targets:
+        return None
+
+    service = ClickUpService(settings)
+    try:
+        lists_block: dict[str, Any] = {}
+        for key, list_id in targets:
+            block = await _fetch_list_block_cached(service, list_id)
+            if block is None:
+                return None
+            lists_block[key] = block
+    finally:
+        await service.aclose()
+
+    try:
+        return ClickUpListsConfig({"lists": lists_block})
+    except ClickUpConfigError:
+        return None
+
+
+async def _load_config(settings: MCPSettings):
+    """Return the field schema, live from the ClickUp API when available.
+
+    The live schema (per-list, cached for ``_SCHEMA_TTL_SECONDS``) is primary;
+    the static ``clickup_fields.json`` is only a fallback used when the API is
+    unavailable. Returns a ``ClickUpListsConfig``, ``None``, or the ``"legacy"``
+    sentinel (from the static fallback).
+    """
+
+    static = ClickUpListsConfig.from_path(settings.clickup_fields_config_path)
+    live = await _load_config_from_api(settings, static)
+    if live is not None:
+        return live
+    return static
+
+
+def _clear_schema_cache() -> None:
+    """Drop all cached live schemas (used by tests and on-demand refresh)."""
+
+    with _schema_cache_lock:
+        _schema_cache.clear()
 
 
 def _legacy_config_response(settings: MCPSettings) -> dict[str, Any]:
@@ -769,7 +937,7 @@ async def clickup_list_tasks(
         missing = _missing_runtime(settings)
         if missing:
             return _not_configured(missing)
-        config = _load_config(settings)
+        config = await _load_config(settings)
         if config == "legacy":
             return _legacy_config_response(settings)
         if config is None or not isinstance(config, ClickUpListsConfig):
@@ -836,7 +1004,7 @@ async def clickup_get_task(
         missing = _missing_runtime(settings)
         if missing:
             return _not_configured(missing)
-        config = _load_config(settings)
+        config = await _load_config(settings)
         if config == "legacy":
             return _legacy_config_response(settings)
         if config is None or not isinstance(config, ClickUpListsConfig):
@@ -891,7 +1059,7 @@ async def clickup_get_tasks_needing_work(
         missing = _missing_runtime(settings)
         if missing:
             return _not_configured(missing)
-        config = _load_config(settings)
+        config = await _load_config(settings)
         if config == "legacy":
             return _legacy_config_response(settings)
         if config is None or not isinstance(config, ClickUpListsConfig):
@@ -1001,7 +1169,7 @@ async def clickup_compute_pipeline_totals(
         missing = _missing_runtime(settings)
         if missing:
             return _not_configured(missing)
-        config = _load_config(settings)
+        config = await _load_config(settings)
         if config == "legacy":
             return _legacy_config_response(settings)
         if config is None or not isinstance(config, ClickUpListsConfig):
@@ -1084,7 +1252,7 @@ async def clickup_update_task_field(
         missing = _missing_runtime(settings)
         if missing:
             return _not_configured(missing)
-        config = _load_config(settings)
+        config = await _load_config(settings)
         if config == "legacy":
             return _legacy_config_response(settings)
         if config is None or not isinstance(config, ClickUpListsConfig):
@@ -1152,7 +1320,7 @@ async def clickup_set_status(
         missing = _missing_runtime(settings)
         if missing:
             return _not_configured(missing)
-        config = _load_config(settings)
+        config = await _load_config(settings)
         if config == "legacy":
             return _legacy_config_response(settings)
         if config is None or not isinstance(config, ClickUpListsConfig):
@@ -1221,7 +1389,7 @@ async def clickup_link_tasks(
         missing = _missing_runtime(settings)
         if missing:
             return _not_configured(missing)
-        config = _load_config(settings)
+        config = await _load_config(settings)
         if config == "legacy":
             return _legacy_config_response(settings)
         if config is None or not isinstance(config, ClickUpListsConfig):
@@ -1356,7 +1524,7 @@ async def clickup_create_subtask(
         missing = _missing_runtime(settings)
         if missing:
             return _not_configured(missing)
-        config = _load_config(settings)
+        config = await _load_config(settings)
         if config == "legacy":
             return _legacy_config_response(settings)
         if config is None or not isinstance(config, ClickUpListsConfig):
