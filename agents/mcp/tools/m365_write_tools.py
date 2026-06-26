@@ -16,6 +16,8 @@ Required delegated Graph permissions, per tool:
 - m365_send_email             → Mail.Send
 - m365_create_calendar_event  → Calendars.ReadWrite
 - m365_upload_to_sharepoint   → Files.ReadWrite.All
+- m365_upload_base64_to_sharepoint → Files.ReadWrite.All
+- m365_download_file          → Files.Read.All
 - m365_create_sharepoint_folder → Files.ReadWrite.All
 - m365_post_teams_message     → ChannelMessage.Send (channel) / Chat.ReadWrite (chat)
 
@@ -431,6 +433,40 @@ async def _graph_request(
             return {}
 
 
+async def _graph_get_bytes(path: str, token: str) -> tuple[bytes, str]:
+    """GET a Graph endpoint that returns raw bytes, e.g. a driveItem `/content`.
+
+    Returns `(content, content_type)`. Graph 302-redirects `/content` to a
+    pre-authenticated download URL on another host; ``follow_redirects=True``
+    chases it (httpx drops the Authorization header on the cross-host hop,
+    which is correct — the redirect URL is already pre-authenticated). Raises
+    `httpx.HTTPStatusError` / `httpx.RequestError` like `_graph_request`; the
+    token is never logged.
+    """
+
+    settings = get_settings()
+    url = f"{GRAPH_BASE}/{path.lstrip('/')}"
+    request_headers = {"Authorization": f"Bearer {token}", "Accept": "*/*"}
+
+    async with httpx.AsyncClient(
+        timeout=settings.integration_http_timeout_seconds, follow_redirects=True
+    ) as client:
+        started = time.perf_counter()
+        response = await client.get(url, headers=request_headers)
+        latency_ms = (time.perf_counter() - started) * 1000
+        log.info(
+            "m365_graph_call",
+            extra={
+                "method": "GET",
+                "path": f"/{path.lstrip('/')}",
+                "status": response.status_code,
+                "latency_ms": round(latency_ms, 1),
+            },
+        )
+        response.raise_for_status()
+        return response.content, response.headers.get("Content-Type", "")
+
+
 def _encode_share_url(url: str) -> str:
     """Encode a sharing/absolute URL into a Graph share id (`u!<base64url>`)."""
 
@@ -770,6 +806,165 @@ async def m365_create_sharepoint_folder(
         )
 
 
+async def m365_download_file(
+    file_url: str,
+    tenant_id: str | None = None,
+    user_id: str | None = None,
+    access_token: str | None = None,
+    permissions: list[str] | None = None,
+) -> dict[str, Any]:
+    """Download a SharePoint file's bytes via Microsoft Graph.
+
+    Requires the delegated `Files.Read.All` scope. The file URL is resolved to
+    its drive/item ids via `/shares/{id}/driveItem`, then the bytes are fetched
+    from `GET /drives/{drive-id}/items/{item-id}/content` (Graph 302-redirects
+    to a pre-authenticated download URL, which httpx follows). The content is
+    returned base64-encoded so it round-trips through JSON; pair it with
+    `m365_upload_base64_to_sharepoint` to read a file, transform it, and write
+    the result back without touching the local filesystem.
+
+    Args:
+        file_url: SharePoint file sharing/absolute URL.
+
+    Returns:
+        `{"status": "ok", "data": {"filename", "content_b64", "mime_type",
+        "size_bytes"}}` or an error envelope.
+    """
+
+    context = _context(tenant_id, user_id, access_token, permissions)
+    with use_tenant_context(context):
+        check_permission(
+            context.tenant_id, context.user_id, "m365_download_file", context.permissions
+        )
+        token = await _get_m365_token(
+            context.access_token, context.user_id, context.tenant_id
+        )
+        if not token:
+            return _err(_NO_TOKEN_MESSAGE)
+        if not file_url:
+            return _err("file_url is required")
+
+        share_id = _encode_share_url(file_url)
+
+        async def _attempt(tok: str) -> dict[str, Any] | None:
+            item = await _graph_request(
+                "GET",
+                f"/shares/{share_id}/driveItem",
+                tok,
+                params={"$select": "id,name,file,size,parentReference"},
+            )
+            drive_id = (item.get("parentReference") or {}).get("driveId", "")
+            item_id = item.get("id", "")
+            if not drive_id or not item_id:
+                return None
+            content, content_type = await _graph_get_bytes(
+                f"/drives/{drive_id}/items/{item_id}/content", tok
+            )
+            mime_type = (
+                (item.get("file") or {}).get("mimeType")
+                or content_type
+                or "application/octet-stream"
+            )
+            return {
+                "filename": item.get("name", ""),
+                "content_b64": base64.b64encode(content).decode("ascii"),
+                "mime_type": mime_type,
+                "size_bytes": len(content),
+            }
+
+        try:
+            data = await _retry_on_401(context, token, _attempt)
+            if data is None:
+                return _err(f"Could not resolve file from {file_url!r}")
+        except httpx.HTTPStatusError as exc:
+            return _err(f"Graph download file failed: HTTP {exc.response.status_code}")
+        except httpx.RequestError as exc:
+            return _err(f"Graph request failed: {exc.__class__.__name__}")
+        return _ok(data)
+
+
+async def m365_upload_base64_to_sharepoint(
+    folder_url: str,
+    filename: str,
+    content_b64: str,
+    tenant_id: str | None = None,
+    user_id: str | None = None,
+    access_token: str | None = None,
+    permissions: list[str] | None = None,
+) -> dict[str, Any]:
+    """Upload base64-encoded bytes to a SharePoint folder via Microsoft Graph.
+
+    The in-memory counterpart of `m365_upload_to_sharepoint`: instead of a
+    local file path it takes the content inline as base64, so an agent can push
+    bytes it produced itself (e.g. a compiled submission PDF) straight to
+    SharePoint without writing them to disk first. Requires the delegated
+    `Files.ReadWrite.All` scope. The folder URL is resolved to its drive/item
+    ids via `/shares/{id}/driveItem`, then the bytes are uploaded with
+    `PUT /drives/{drive-id}/items/{folder-id}:/{filename}:/content`. Suitable
+    for simple (small-file) uploads only; very large files would need an upload
+    session, which is out of scope here.
+
+    Args:
+        folder_url: SharePoint destination folder sharing/absolute URL.
+        filename: Name for the uploaded file.
+        content_b64: File bytes, base64-encoded.
+
+    Returns:
+        `{"status": "ok", "data": {"file_url", "filename", "size_bytes"}}` or an
+        error envelope.
+    """
+
+    context = _context(tenant_id, user_id, access_token, permissions)
+    with use_tenant_context(context):
+        check_permission(
+            context.tenant_id,
+            context.user_id,
+            "m365_upload_base64_to_sharepoint",
+            context.permissions,
+        )
+        token = await _get_m365_token(
+            context.access_token, context.user_id, context.tenant_id
+        )
+        if not token:
+            return _err(_NO_TOKEN_MESSAGE)
+        if not filename:
+            return _err("filename is required")
+        try:
+            content = base64.b64decode(content_b64 or "", validate=True)
+        except (ValueError, TypeError):
+            return _err("content_b64 is not valid base64")
+
+        async def _attempt(tok: str) -> dict[str, Any] | None:
+            drive_id, folder_id = await _resolve_drive_item(folder_url, tok)
+            if not drive_id or not folder_id:
+                return None
+            return await _graph_request(
+                "PUT",
+                f"/drives/{drive_id}/items/{folder_id}:/{filename}:/content",
+                tok,
+                content=content,
+                headers={"Content-Type": "application/octet-stream"},
+            )
+
+        try:
+            uploaded = await _retry_on_401(context, token, _attempt)
+            if uploaded is None:
+                return _err(
+                    f"Could not resolve destination folder from {folder_url!r}"
+                )
+        except httpx.HTTPStatusError as exc:
+            return _err(f"Graph upload failed: HTTP {exc.response.status_code}")
+        except httpx.RequestError as exc:
+            return _err(f"Graph request failed: {exc.__class__.__name__}")
+        return _ok(
+            {
+                "file_url": uploaded.get("webUrl"),
+                "filename": uploaded.get("name", filename),
+                "size_bytes": uploaded.get("size", len(content)),
+            }
+        )
+
+
 async def m365_post_teams_message(
     channel_or_chat_id: str,
     message: str,
@@ -846,5 +1041,7 @@ def register(mcp: Any) -> None:
     mcp.tool()(m365_send_email)
     mcp.tool()(m365_create_calendar_event)
     mcp.tool()(m365_upload_to_sharepoint)
+    mcp.tool()(m365_upload_base64_to_sharepoint)
+    mcp.tool()(m365_download_file)
     mcp.tool()(m365_create_sharepoint_folder)
     mcp.tool()(m365_post_teams_message)

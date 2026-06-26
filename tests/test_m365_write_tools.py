@@ -299,6 +299,207 @@ async def test_create_sharepoint_folder_error_on_resolve_404() -> None:
 
 
 # ---------------------------------------------------------------------------
+# m365_download_file
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_download_file_happy_path() -> None:
+    file_url = "https://contoso.sharepoint.com/sites/Finance/Shared%20Documents/rfq.pdf"
+    share_id = m365_write_tools._encode_share_url(file_url)
+    payload = b"%PDF-1.7 compliance doc bytes"
+
+    with respx.mock(assert_all_called=True) as mock:
+        mock.get(f"{GRAPH}/shares/{share_id}/driveItem").mock(
+            return_value=httpx.Response(
+                200,
+                json={
+                    "id": "item1",
+                    "name": "rfq.pdf",
+                    "file": {"mimeType": "application/pdf"},
+                    "size": len(payload),
+                    "parentReference": {"driveId": "drive1"},
+                },
+            )
+        )
+        mock.get(f"{GRAPH}/drives/drive1/items/item1/content").mock(
+            return_value=httpx.Response(200, content=payload)
+        )
+        result = await m365_write_tools.m365_download_file(
+            file_url=file_url,
+            access_token=TOKEN,
+            permissions=PERMS,
+        )
+
+    assert result["status"] == "ok"
+    assert result["data"]["filename"] == "rfq.pdf"
+    assert result["data"]["mime_type"] == "application/pdf"
+    assert result["data"]["size_bytes"] == len(payload)
+    import base64 as _b64
+
+    assert _b64.b64decode(result["data"]["content_b64"]) == payload
+
+
+@pytest.mark.asyncio
+async def test_download_file_falls_back_to_content_type_header() -> None:
+    file_url = "https://contoso.sharepoint.com/sites/Finance/note.bin"
+    share_id = m365_write_tools._encode_share_url(file_url)
+
+    with respx.mock(assert_all_called=True) as mock:
+        # No `file` facet in the resolve response → mime falls back to the
+        # download response's Content-Type header.
+        mock.get(f"{GRAPH}/shares/{share_id}/driveItem").mock(
+            return_value=httpx.Response(
+                200,
+                json={
+                    "id": "item1",
+                    "name": "note.bin",
+                    "parentReference": {"driveId": "drive1"},
+                },
+            )
+        )
+        mock.get(f"{GRAPH}/drives/drive1/items/item1/content").mock(
+            return_value=httpx.Response(
+                200, content=b"abc", headers={"Content-Type": "text/plain"}
+            )
+        )
+        result = await m365_write_tools.m365_download_file(
+            file_url=file_url,
+            access_token=TOKEN,
+            permissions=PERMS,
+        )
+
+    assert result["status"] == "ok"
+    assert result["data"]["mime_type"] == "text/plain"
+
+
+@pytest.mark.asyncio
+async def test_download_file_error_on_resolve_404() -> None:
+    file_url = "https://contoso.sharepoint.com/sites/Finance/missing.pdf"
+    share_id = m365_write_tools._encode_share_url(file_url)
+
+    with respx.mock(assert_all_called=True) as mock:
+        mock.get(f"{GRAPH}/shares/{share_id}/driveItem").mock(
+            return_value=httpx.Response(404, json={"error": "not found"})
+        )
+        result = await m365_write_tools.m365_download_file(
+            file_url=file_url,
+            access_token=TOKEN,
+            permissions=PERMS,
+        )
+
+    assert result["status"] == "error"
+    assert "404" in (result["error"] or "")
+
+
+@pytest.mark.asyncio
+async def test_download_file_error_when_drive_unresolvable() -> None:
+    file_url = "https://contoso.sharepoint.com/sites/Finance/odd.pdf"
+    share_id = m365_write_tools._encode_share_url(file_url)
+
+    with respx.mock(assert_all_called=True) as mock:
+        # Resolve succeeds but yields no driveId → cannot build the content path.
+        mock.get(f"{GRAPH}/shares/{share_id}/driveItem").mock(
+            return_value=httpx.Response(200, json={"id": "item1", "name": "odd.pdf"})
+        )
+        result = await m365_write_tools.m365_download_file(
+            file_url=file_url,
+            access_token=TOKEN,
+            permissions=PERMS,
+        )
+
+    assert result["status"] == "error"
+    assert "Could not resolve file" in (result["error"] or "")
+
+
+# ---------------------------------------------------------------------------
+# m365_upload_base64_to_sharepoint
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_upload_base64_happy_path() -> None:
+    import base64 as _b64
+
+    folder_url = "https://contoso.sharepoint.com/sites/Finance/Shared%20Documents/Submissions"
+    share_id = m365_write_tools._encode_share_url(folder_url)
+    raw = b"%PDF compiled submission"
+    content_b64 = _b64.b64encode(raw).decode("ascii")
+
+    with respx.mock(assert_all_called=True) as mock:
+        mock.get(f"{GRAPH}/shares/{share_id}/driveItem").mock(
+            return_value=httpx.Response(
+                200,
+                json={"id": "folder1", "parentReference": {"driveId": "drive1"}},
+            )
+        )
+        route = mock.route(
+            method="PUT",
+            url__regex=r"https://graph\.microsoft\.com/v1\.0/drives/drive1/items/folder1.*content",
+        ).mock(
+            return_value=httpx.Response(
+                201,
+                json={
+                    "id": "file1",
+                    "name": "submission.pdf",
+                    "size": len(raw),
+                    "webUrl": "https://sp/submission.pdf",
+                },
+            )
+        )
+        result = await m365_write_tools.m365_upload_base64_to_sharepoint(
+            folder_url=folder_url,
+            filename="submission.pdf",
+            content_b64=content_b64,
+            access_token=TOKEN,
+            permissions=PERMS,
+        )
+
+    assert result["status"] == "ok"
+    assert result["data"]["file_url"] == "https://sp/submission.pdf"
+    assert result["data"]["filename"] == "submission.pdf"
+    assert result["data"]["size_bytes"] == len(raw)
+    # The decoded bytes — not the base64 text — are what gets PUT.
+    assert route.calls[0].request.content == raw
+
+
+@pytest.mark.asyncio
+async def test_upload_base64_rejects_invalid_base64() -> None:
+    result = await m365_write_tools.m365_upload_base64_to_sharepoint(
+        folder_url="https://contoso.sharepoint.com/sites/Finance/Docs",
+        filename="x.pdf",
+        content_b64="not!!valid!!base64",
+        access_token=TOKEN,
+        permissions=PERMS,
+    )
+    assert result["status"] == "error"
+    assert "base64" in (result["error"] or "")
+
+
+@pytest.mark.asyncio
+async def test_upload_base64_error_on_resolve_403() -> None:
+    import base64 as _b64
+
+    folder_url = "https://contoso.sharepoint.com/sites/Finance/Locked"
+    share_id = m365_write_tools._encode_share_url(folder_url)
+
+    with respx.mock(assert_all_called=True) as mock:
+        mock.get(f"{GRAPH}/shares/{share_id}/driveItem").mock(
+            return_value=httpx.Response(403, json={"error": "forbidden"})
+        )
+        result = await m365_write_tools.m365_upload_base64_to_sharepoint(
+            folder_url=folder_url,
+            filename="x.pdf",
+            content_b64=_b64.b64encode(b"data").decode("ascii"),
+            access_token=TOKEN,
+            permissions=PERMS,
+        )
+
+    assert result["status"] == "error"
+    assert "403" in (result["error"] or "")
+
+
+# ---------------------------------------------------------------------------
 # m365_post_teams_message
 # ---------------------------------------------------------------------------
 

@@ -35,6 +35,10 @@ TOOL_POLICIES: dict[str, ToolPolicy] = {
     "m365_send_email": ToolPolicy(required_any={"m365_access"}, write=True),
     "m365_create_calendar_event": ToolPolicy(required_any={"m365_access"}, write=True),
     "m365_upload_to_sharepoint": ToolPolicy(required_any={"m365_access"}, write=True),
+    "m365_upload_base64_to_sharepoint": ToolPolicy(
+        required_any={"m365_access"}, write=True
+    ),
+    "m365_download_file": ToolPolicy(required_any={"m365_access"}),
     "m365_create_sharepoint_folder": ToolPolicy(
         required_any={"m365_access"}, write=True
     ),
