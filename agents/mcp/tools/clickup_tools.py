@@ -3,6 +3,7 @@
 Lists:
 - ``investor_relations`` — long-term funder relationship database.
 - ``fundraising_pipeline`` — active grant/funder applications in flight.
+- ``rfq_tracker`` — tender / RFQ opportunities sourced from public portals.
 
 Native ClickUp statuses (configured in the workspace) are the workflow.
 Tools never create or modify statuses — they only read them and validate
@@ -53,6 +54,7 @@ log = logging.getLogger(__name__)
 
 IR_KEY = "investor_relations"
 PIPELINE_KEY = "fundraising_pipeline"
+RFQ_KEY = "rfq_tracker"
 
 _DEFAULT_NEEDING_WORK: dict[str, list[str]] = {
     IR_KEY: ["ACTIVE"],
@@ -746,6 +748,7 @@ async def _load_config_from_api(
     for key, env_id in (
         (IR_KEY, settings.clickup_ir_list_id),
         (PIPELINE_KEY, settings.clickup_pipeline_list_id),
+        (RFQ_KEY, settings.clickup_rfq_list_id),
     ):
         list_id = env_id
         if not list_id and static_cfg is not None:
@@ -830,11 +833,17 @@ def _resolve_list(
         if list_key == IR_KEY
         else settings.clickup_pipeline_list_id
         if list_key == PIPELINE_KEY
+        else settings.clickup_rfq_list_id
+        if list_key == RFQ_KEY
         else ""
     )
     list_id = env_id or list_cfg.list_id
     if not list_id:
-        env_name = "CLICKUP_IR_LIST_ID" if list_key == IR_KEY else "CLICKUP_PIPELINE_LIST_ID"
+        env_name = {
+            IR_KEY: "CLICKUP_IR_LIST_ID",
+            PIPELINE_KEY: "CLICKUP_PIPELINE_LIST_ID",
+            RFQ_KEY: "CLICKUP_RFQ_LIST_ID",
+        }.get(list_key, "CLICKUP_IR_LIST_ID")
         return _not_configured([env_name])
     return list_cfg, list_id
 

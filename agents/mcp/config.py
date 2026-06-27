@@ -163,6 +163,9 @@ class MCPSettings(BaseSettings):
     clickup_pipeline_list_id: str = Field(
         default="", validation_alias="CLICKUP_PIPELINE_LIST_ID"
     )
+    clickup_rfq_list_id: str = Field(
+        default="", validation_alias="CLICKUP_RFQ_LIST_ID"
+    )
     clickup_custom_fields_config_path: str = Field(
         default=".config/clickup_fields.json",
         validation_alias="CLICKUP_CUSTOM_FIELDS_CONFIG_PATH",

@@ -200,6 +200,80 @@
         "invested",
         "complete"
       ]
+    },
+    "rfq_tracker": {
+      "fields": {
+        "B-BBEE Required": {
+          "options": [
+            {
+              "name": "Level 1",
+              "orderindex": 0
+            },
+            {
+              "name": "Level 2",
+              "orderindex": 1
+            },
+            {
+              "name": "Level 3",
+              "orderindex": 2
+            },
+            {
+              "name": "Any",
+              "orderindex": 3
+            },
+            {
+              "name": "Not specified",
+              "orderindex": 4
+            }
+          ],
+          "type": "drop_down"
+        },
+        "Closing Date": {
+          "type": "date"
+        },
+        "Eligibility Score": {
+          "type": "number"
+        },
+        "Estimated Value": {
+          "type": "currency"
+        },
+        "Issuing Authority": {
+          "type": "text"
+        },
+        "Reference Number": {
+          "type": "text"
+        },
+        "Source Portal": {
+          "options": [
+            {
+              "name": "eTender",
+              "orderindex": 0
+            },
+            {
+              "name": "CIDB",
+              "orderindex": 1
+            },
+            {
+              "name": "National Treasury",
+              "orderindex": 2
+            },
+            {
+              "name": "Direct",
+              "orderindex": 3
+            },
+            {
+              "name": "Other",
+              "orderindex": 4
+            }
+          ],
+          "type": "drop_down"
+        },
+        "SharePoint Link": {
+          "type": "url"
+        }
+      },
+      "list_id": "901215234539",
+      "statuses": []
     }
   }
 }

@@ -56,6 +56,12 @@ from agents.mcp.config import get_settings  # noqa: E402
 
 IR_KEY = "investor_relations"
 PIPELINE_KEY = "fundraising_pipeline"
+RFQ_KEY = "rfq_tracker"
+
+# The RFQ tracker list id is fixed for this workspace. CLICKUP_RFQ_LIST_ID may
+# override it, but it defaults to the known list so the script runs without an
+# extra env var.
+RFQ_LIST_ID_DEFAULT = "901215234539"
 
 
 LISTS: dict[str, dict[str, Any]] = {
@@ -114,6 +120,41 @@ LISTS: dict[str, dict[str, Any]] = {
             "Lead Partner",
             "Estimated Amount",
         ],
+    },
+    RFQ_KEY: {
+        "env_var": "CLICKUP_RFQ_LIST_ID",
+        "display": "RFQ Tracker",
+        "managed_fields": [
+            {"name": "Reference Number", "type": "text"},
+            {"name": "Issuing Authority", "type": "text"},
+            {"name": "Closing Date", "type": "date"},
+            {"name": "Estimated Value", "type": "currency"},
+            {
+                "name": "Source Portal",
+                "type": "drop_down",
+                "options": [
+                    "eTender",
+                    "CIDB",
+                    "National Treasury",
+                    "Direct",
+                    "Other",
+                ],
+            },
+            {"name": "Eligibility Score", "type": "number"},
+            {
+                "name": "B-BBEE Required",
+                "type": "drop_down",
+                "options": [
+                    "Level 1",
+                    "Level 2",
+                    "Level 3",
+                    "Any",
+                    "Not specified",
+                ],
+            },
+            {"name": "SharePoint Link", "type": "url"},
+        ],
+        "expected_existing": [],
     },
 }
 
@@ -364,6 +405,7 @@ def main() -> int:
     team_id = settings.clickup_team_id
     ir_list_id = settings.clickup_ir_list_id
     pipeline_list_id = settings.clickup_pipeline_list_id
+    rfq_list_id = settings.clickup_rfq_list_id or RFQ_LIST_ID_DEFAULT
     config_path = settings.clickup_fields_config_path
     base_url = settings.clickup_base_url.rstrip("/")
 
@@ -389,7 +431,11 @@ def main() -> int:
 
     lists_block: dict[str, dict[str, Any]] = {}
     reports: dict[str, dict[str, Any]] = {}
-    list_ids = {IR_KEY: ir_list_id, PIPELINE_KEY: pipeline_list_id}
+    list_ids = {
+        IR_KEY: ir_list_id,
+        PIPELINE_KEY: pipeline_list_id,
+        RFQ_KEY: rfq_list_id,
+    }
 
     for key, spec in LISTS.items():
         list_id = list_ids[key]
