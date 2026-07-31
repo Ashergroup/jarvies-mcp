@@ -30,6 +30,10 @@ log = logging.getLogger(__name__)
 # get a 401 with a WWW-Authenticate challenge to start the OAuth flow.
 PUBLIC_PATHS = {"/health"} | OAUTH_PUBLIC_PATHS | CONSENT_PUBLIC_PATHS
 
+# The portal (/portal/*) enforces its own signed-cookie sessions, so the MCP
+# bearer/JWT auth layer must not gate it — same treatment as /admin/*.
+PORTAL_PATH_PREFIX = "/portal"
+
 
 def log_production_safety_warnings() -> None:
     """Warn loudly about unsafe production configuration. Never raises.
@@ -87,6 +91,10 @@ class MCPAuthMiddleware(BaseHTTPMiddleware):
         # the admin route handlers, so the MCP bearer/JWT auth layer must not gate
         # it. The handlers return 401 themselves when the key is missing or wrong.
         if path == "/admin" or path.startswith("/admin/"):
+            return await call_next(request)
+
+        # /portal/* runs its own session auth (portal.sessions); do not gate it.
+        if path == PORTAL_PATH_PREFIX or path.startswith(PORTAL_PATH_PREFIX + "/"):
             return await call_next(request)
 
         if settings.allow_unauthenticated and not settings.is_production:

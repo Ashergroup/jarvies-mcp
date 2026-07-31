@@ -19,9 +19,11 @@ from agents.mcp.auth import MCPAuthMiddleware, log_production_safety_warnings
 from agents.mcp.config import get_settings
 from agents.mcp.database import close_pool, init_pool
 from agents.mcp.oauth import register_oauth_routes
+from agents.mcp.portal_schema import ensure_portal_schema
 from agents.mcp.proxy import ForwardedProtoMiddleware
 from agents.mcp.tenant import TenantResolutionMiddleware
 from agents.mcp.tool_registry import register_all_tools
+from portal.app import build_portal_routes
 
 
 def configure_logging() -> None:
@@ -118,6 +120,9 @@ async def _lifespan(app_: Any) -> AsyncIterator[None]:
             await init_pool()
             # Idempotent admin-consent schema (oauth_states + tenants columns).
             await ensure_consent_schema()
+            # Idempotent portal schema (users columns + licenses/audit_log/
+            # connector_installs + tenant_credentials ciphertext columns).
+            await ensure_portal_schema()
         except Exception:
             log.exception("db_pool_init_failed_continuing")
     else:
@@ -161,5 +166,10 @@ register_admin_routes(app)
 # MCPAuthMiddleware (see auth.CONSENT_PUBLIC_PATHS); /auth/callback is already
 # registered by register_oauth_routes and stays public.
 register_consent_routes(app)
+
+# Portal UI (/portal/*, sales portal today). Exempt from MCPAuthMiddleware via
+# auth.PORTAL_PATH_PREFIX; enforces its own signed-cookie sessions.
+for portal_route in build_portal_routes():
+    app.router.routes.append(portal_route)
 
 log.info("mcp_server_ready", extra={"endpoint": "/mcp"})
