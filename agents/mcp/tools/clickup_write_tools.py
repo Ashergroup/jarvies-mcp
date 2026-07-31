@@ -85,6 +85,9 @@ class ClickUpWriteService(ClickUpService):
     async def create_form(self, list_id: str, body: dict[str, Any]) -> dict[str, Any]:
         return await self._request("POST", f"list/{list_id}/view", json_body=body)
 
+    async def create_task(self, list_id: str, body: dict[str, Any]) -> dict[str, Any]:
+        return await self._request("POST", f"list/{list_id}/task", json_body=body)
+
     async def get_lists_in_folder(self, folder_id: str) -> dict[str, Any]:
         return await self._request("GET", f"folder/{folder_id}/list")
 
@@ -562,6 +565,64 @@ async def clickup_create_form(
         return await _run(_do, "clickup_create_form", settings)
 
 
+async def clickup_create_task(
+    list_id: str,
+    name: str,
+    description: str | None = None,
+    status: str | None = None,
+    due_date_ms: int | None = None,
+    tenant_id: str | None = None,
+    user_id: str | None = None,
+    access_token: str | None = None,
+    permissions: list[str] | None = None,
+) -> dict[str, Any]:
+    """Create a task in a list (``POST /list/{id}/task``).
+
+    Config-free: works with any list the API token can reach (raw ClickUp list
+    id), no per-list field schema needed.
+
+    Args:
+        list_id: Raw ClickUp list id to create the task in.
+        name: Task name.
+        description: Optional task description (plain text).
+        status: Optional initial status name; must be a valid status in the
+            list, otherwise ClickUp rejects the call.
+        due_date_ms: Optional due date as Unix epoch milliseconds.
+    """
+
+    context = _context(tenant_id, user_id, access_token, permissions)
+    with use_tenant_context(context):
+        check_permission(
+            context.tenant_id, context.user_id, "clickup_create_task", context.permissions
+        )
+        settings = await _resolve_settings()
+        missing = _missing_token(settings)
+        if missing:
+            return _not_configured(missing)
+        if not list_id:
+            return _error(400, "list_id is required")
+        if not name:
+            return _error(400, "name is required")
+
+        body: dict[str, Any] = {"name": name}
+        if description is not None:
+            body["description"] = description
+        if status:
+            body["status"] = status
+        if due_date_ms is not None:
+            body["due_date"] = int(due_date_ms)
+
+        async def _do(service: ClickUpWriteService) -> dict[str, Any]:
+            created = await service.create_task(list_id, body)
+            return _ok(
+                task_id=created.get("id", ""),
+                name=created.get("name", name),
+                url=created.get("url"),
+            )
+
+        return await _run(_do, "clickup_create_task", settings)
+
+
 def register(mcp: Any) -> None:
     """Register ClickUp workspace-structure tools."""
 
@@ -575,3 +636,4 @@ def register(mcp: Any) -> None:
     mcp.tool()(clickup_create_space)
     mcp.tool()(clickup_delete_task)
     mcp.tool()(clickup_create_form)
+    mcp.tool()(clickup_create_task)

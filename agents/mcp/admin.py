@@ -20,13 +20,13 @@ from __future__ import annotations
 import hmac
 import json
 import logging
-import uuid
 from typing import Any
 
 from starlette.requests import Request
 from starlette.responses import JSONResponse
 from starlette.routing import Route
 
+from agents.mcp import credentials
 from agents.mcp.config import get_settings
 from agents.mcp.database import get_conn
 
@@ -95,12 +95,20 @@ async def _fetch_tenant(tenant_id: str) -> dict[str, Any] | None:
 
 
 async def _fetch_credentials(tenant_id: str) -> dict[str, dict[str, Any]]:
-    """Return {credential_type: {"credential_key": ..., "metadata": {...}}}."""
+    """Return {credential_type: {"credential_key": <plaintext>, "metadata": {...}}}.
+
+    ``credential_key`` is the DECRYPTED primary secret: encrypted rows are
+    decrypted (via the shared ``credentials.decrypt_credential_row``) so the
+    patch-merge in ``set_credentials`` preserves an existing secret when a
+    partial update omits it. Legacy plaintext rows pass through unchanged. The
+    decrypted value never leaves the server (``view_credentials`` returns field
+    names only).
+    """
 
     async with get_conn() as conn:
         rows = await conn.fetch(
-            "SELECT credential_type, credential_key, metadata "
-            "FROM tenant_credentials WHERE tenant_id::text = $1",
+            "SELECT credential_type, credential_key, credential_ciphertext, "
+            "key_version, metadata FROM tenant_credentials WHERE tenant_id::text = $1",
             tenant_id,
         )
     result: dict[str, dict[str, Any]] = {}
@@ -112,7 +120,13 @@ async def _fetch_credentials(tenant_id: str) -> dict[str, dict[str, Any]]:
             except json.JSONDecodeError:
                 metadata = {}
         result[row["credential_type"]] = {
-            "credential_key": row["credential_key"],
+            "credential_key": credentials.decrypt_credential_row(
+                {
+                    "credential_key": row["credential_key"],
+                    "credential_ciphertext": row["credential_ciphertext"],
+                    "key_version": row["key_version"],
+                }
+            ),
             "metadata": metadata or {},
         }
     return result
@@ -122,29 +136,13 @@ async def _upsert_credentials(tenant_uuid: str, rows: dict[str, dict[str, Any]])
     """Upsert one tenant_credentials row per credential_type in `rows`.
 
     `rows` maps credential_type -> {"credential_key": ..., "metadata": {...}}.
-    Each row is written in full (already merged with any existing values by the
-    caller), in a single transaction.
+    Delegates to the shared ``credentials.upsert_tenant_credentials`` so the
+    primary secret is encrypted at rest (credential_ciphertext + key_version)
+    and never stored as plaintext — the admin API no longer writes the table
+    directly.
     """
 
-    async with get_conn() as conn:
-        async with conn.transaction():
-            for credential_type, payload in rows.items():
-                await conn.execute(
-                    """
-                    INSERT INTO tenant_credentials
-                        (tenant_id, credential_type, credential_key, metadata)
-                    VALUES ($1, $2, $3, $4::jsonb)
-                    ON CONFLICT (tenant_id, credential_type)
-                    DO UPDATE SET
-                        credential_key = EXCLUDED.credential_key,
-                        metadata = EXCLUDED.metadata,
-                        updated_at = now()
-                    """,
-                    uuid.UUID(tenant_uuid),
-                    credential_type,
-                    payload.get("credential_key"),
-                    json.dumps(payload.get("metadata") or {}),
-                )
+    await credentials.upsert_tenant_credentials(tenant_uuid, rows)
 
 
 async def _list_tenants() -> list[dict[str, Any]]:

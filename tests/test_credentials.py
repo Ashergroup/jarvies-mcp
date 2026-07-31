@@ -8,12 +8,15 @@ and env credentials otherwise.
 
 from __future__ import annotations
 
+import json
+
 import httpx
 import pytest
 import respx
+from cryptography.fernet import Fernet
 
 from agents.mcp import config as mcp_config
-from agents.mcp import credentials
+from agents.mcp import credentials, crypto
 from agents.mcp import tenant as mcp_tenant
 from agents.mcp.tools import cin7_tools, freshsales_tools, xero_tools
 
@@ -23,8 +26,21 @@ TENANT = {"id": "33333333-3333-3333-3333-333333333333", "display_name": "Acme"}
 @pytest.fixture(autouse=True)
 def _clear_settings_cache():
     mcp_config.get_settings.cache_clear()
+    crypto.get_cipher.cache_clear()
     yield
     mcp_config.get_settings.cache_clear()
+    crypto.get_cipher.cache_clear()
+
+
+@pytest.fixture
+def _encryption_key(monkeypatch: pytest.MonkeyPatch) -> str:
+    """Configure a real Fernet key and return it (cache already cleared)."""
+
+    key = Fernet.generate_key().decode()
+    monkeypatch.setenv("JARVIES_ENCRYPTION_KEY", key)
+    mcp_config.get_settings.cache_clear()
+    crypto.get_cipher.cache_clear()
+    return key
 
 
 @pytest.fixture
@@ -236,12 +252,23 @@ async def test_xero_uses_db_credentials(
 # ---------------------------------------------------------------------------
 
 
+class _FakeTxn:
+    async def __aenter__(self) -> _FakeTxn:
+        return self
+
+    async def __aexit__(self, *exc) -> bool:
+        return False
+
+
 class _FakeConn:
     def __init__(self, recorder: list) -> None:
         self._recorder = recorder
 
     async def execute(self, query: str, *args) -> None:
         self._recorder.append((query, args))
+
+    def transaction(self) -> _FakeTxn:
+        return _FakeTxn()
 
 
 class _FakeConnCtx:
@@ -257,7 +284,7 @@ class _FakeConnCtx:
 
 @pytest.mark.asyncio
 async def test_persist_xero_refresh_token_executes_update(
-    monkeypatch: pytest.MonkeyPatch,
+    monkeypatch: pytest.MonkeyPatch, _encryption_key: str
 ) -> None:
     recorder: list = []
     monkeypatch.setattr(credentials, "get_conn", lambda: _FakeConnCtx(recorder))
@@ -266,9 +293,17 @@ async def test_persist_xero_refresh_token_executes_update(
 
     assert len(recorder) == 1
     query, args = recorder[0]
+    # Encrypted write: ciphertext + key_version set, legacy plaintext NULLed.
     assert "UPDATE tenant_credentials" in query
-    assert "credential_key = $1" in query
-    assert args == ("rotated-token", TENANT["id"])
+    assert "credential_ciphertext = $1" in query
+    assert "key_version = $2" in query
+    assert "credential_key = NULL" in query
+    ciphertext, key_version, tenant_id = args
+    assert tenant_id == TENANT["id"]
+    assert key_version == 1
+    # The plaintext token is never written; the stored bytes decrypt back to it.
+    assert b"rotated-token" not in ciphertext
+    assert crypto.get_cipher().decrypt(ciphertext, key_version) == "rotated-token"
 
 
 @pytest.mark.asyncio
@@ -285,7 +320,7 @@ async def test_persist_xero_refresh_token_swallows_db_error(
 
 @pytest.mark.asyncio
 async def test_xero_rotation_persisted_to_db_after_refresh(
-    monkeypatch: pytest.MonkeyPatch, _with_tenant
+    monkeypatch: pytest.MonkeyPatch, _with_tenant, _encryption_key: str
 ) -> None:
     monkeypatch.setenv("XERO_IDENTITY_URL", "https://identity.test/connect/token")
     monkeypatch.setenv("XERO_BASE_URL", "https://api.test/api.xro/2.0")
@@ -324,11 +359,14 @@ async def test_xero_rotation_persisted_to_db_after_refresh(
         result = await xero_tools.xero_get_contacts(permissions=["finance_access"])
 
     assert result["status"] == "ok"
-    # The rotated token was persisted back to the tenant's DB row.
+    # The rotated token was persisted back to the tenant's DB row, encrypted.
     assert len(recorder) == 1
     query, args = recorder[0]
     assert "UPDATE tenant_credentials" in query
-    assert args == ("rotated-new-token", TENANT["id"])
+    ciphertext, key_version, tenant_id = args
+    assert tenant_id == TENANT["id"]
+    assert b"rotated-new-token" not in ciphertext
+    assert crypto.get_cipher().decrypt(ciphertext, key_version) == "rotated-new-token"
 
 
 @pytest.mark.asyncio
@@ -370,3 +408,154 @@ async def test_xero_call_succeeds_even_if_rotation_persist_fails(
 
     # Persistence failed, but the original Xero call still succeeded.
     assert result["status"] == "ok"
+
+
+# ---------------------------------------------------------------------------
+# Encryption at rest: read paths (legacy plaintext vs new ciphertext)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_read_legacy_plaintext_row(monkeypatch: pytest.MonkeyPatch) -> None:
+    # Pre-encryption row: credential_key set, credential_ciphertext NULL. No
+    # encryption key configured — the legacy path must not require one.
+    async def legacy_row(tenant_id: str, credential_type: str):
+        return {
+            "credential_key": "legacy-plaintext-refresh",
+            "credential_ciphertext": None,
+            "key_version": None,
+            "metadata": {"client_id": "cid"},
+        }
+
+    monkeypatch.setattr(credentials, "get_tenant_credentials", legacy_row)
+    creds = await credentials._get_tenant_credentials(TENANT["id"], "xero")
+    assert creds == {
+        "credential_key": "legacy-plaintext-refresh",
+        "metadata": {"client_id": "cid"},
+    }
+
+
+@pytest.mark.asyncio
+async def test_read_ciphertext_row_decrypts(
+    monkeypatch: pytest.MonkeyPatch, _encryption_key: str
+) -> None:
+    ciphertext, key_version = crypto.get_cipher().encrypt("encrypted-refresh")
+
+    async def ciphertext_row(tenant_id: str, credential_type: str):
+        return {
+            "credential_key": None,
+            "credential_ciphertext": ciphertext,
+            "key_version": key_version,
+            "metadata": {"client_id": "cid"},
+        }
+
+    monkeypatch.setattr(credentials, "get_tenant_credentials", ciphertext_row)
+    creds = await credentials._get_tenant_credentials(TENANT["id"], "xero")
+    assert creds == {
+        "credential_key": "encrypted-refresh",
+        "metadata": {"client_id": "cid"},
+    }
+
+
+@pytest.mark.asyncio
+async def test_read_ciphertext_unknown_key_version_raises(
+    monkeypatch: pytest.MonkeyPatch, _encryption_key: str
+) -> None:
+    ciphertext, _ = crypto.get_cipher().encrypt("encrypted-refresh")
+
+    async def bad_version_row(tenant_id: str, credential_type: str):
+        return {
+            "credential_key": None,
+            "credential_ciphertext": ciphertext,
+            "key_version": 999,  # no such key
+            "metadata": {},
+        }
+
+    monkeypatch.setattr(credentials, "get_tenant_credentials", bad_version_row)
+    with pytest.raises(crypto.CryptoDecryptError):
+        await credentials._get_tenant_credentials(TENANT["id"], "xero")
+
+
+@pytest.mark.asyncio
+async def test_read_ciphertext_without_key_raises_not_configured(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # Produce a ciphertext under a real key, then read it with the key removed.
+    key = Fernet.generate_key().decode()
+    monkeypatch.setenv("JARVIES_ENCRYPTION_KEY", key)
+    mcp_config.get_settings.cache_clear()
+    crypto.get_cipher.cache_clear()
+    ciphertext, key_version = crypto.get_cipher().encrypt("encrypted-refresh")
+
+    # Now unset the key: reading a ciphertext row must fail loud, not return None.
+    monkeypatch.setenv("JARVIES_ENCRYPTION_KEY", "")
+    mcp_config.get_settings.cache_clear()
+    crypto.get_cipher.cache_clear()
+
+    async def ciphertext_row(tenant_id: str, credential_type: str):
+        return {
+            "credential_key": None,
+            "credential_ciphertext": ciphertext,
+            "key_version": key_version,
+            "metadata": {},
+        }
+
+    monkeypatch.setattr(credentials, "get_tenant_credentials", ciphertext_row)
+    with pytest.raises(crypto.CryptoNotConfiguredError):
+        await credentials._get_tenant_credentials(TENANT["id"], "xero")
+
+
+# ---------------------------------------------------------------------------
+# Encryption at rest: write path (encrypts, NULLs plaintext)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_upsert_encrypts_and_nulls_plaintext(
+    monkeypatch: pytest.MonkeyPatch, _encryption_key: str
+) -> None:
+    recorder: list = []
+    monkeypatch.setattr(credentials, "get_conn", lambda: _FakeConnCtx(recorder))
+
+    await credentials.upsert_tenant_credentials(
+        TENANT["id"],
+        {
+            "xero": {
+                "credential_key": "plaintext-refresh",
+                "metadata": {"client_id": "cid"},
+            }
+        },
+    )
+
+    assert len(recorder) == 1
+    query, args = recorder[0]
+    assert "INSERT INTO tenant_credentials" in query
+    assert "credential_key = NULL" in query  # never persists plaintext
+    _tenant_uuid, credential_type, ciphertext, key_version, metadata_json = args
+    assert credential_type == "xero"
+    assert key_version == 1
+    # Ciphertext, not plaintext, is stored; it decrypts back to the secret.
+    assert b"plaintext-refresh" not in ciphertext
+    assert crypto.get_cipher().decrypt(ciphertext, key_version) == "plaintext-refresh"
+    # metadata JSONB is written unchanged.
+    assert json.loads(metadata_json) == {"client_id": "cid"}
+
+
+@pytest.mark.asyncio
+async def test_upsert_without_secret_writes_no_ciphertext(
+    monkeypatch: pytest.MonkeyPatch, _encryption_key: str
+) -> None:
+    # A metadata-only row (no primary secret) writes NULL ciphertext, not an
+    # encryption of the empty string.
+    recorder: list = []
+    monkeypatch.setattr(credentials, "get_conn", lambda: _FakeConnCtx(recorder))
+
+    await credentials.upsert_tenant_credentials(
+        TENANT["id"],
+        {"xero": {"credential_key": None, "metadata": {"client_id": "cid"}}},
+    )
+
+    _query, args = recorder[0]
+    _tenant_uuid, _ctype, ciphertext, key_version, _metadata = args
+    assert ciphertext is None
+    assert key_version is None

@@ -129,7 +129,7 @@ async def get_tenant_credentials(tenant_id: str, credential_type: str) -> dict[s
         async with get_conn() as conn:
             row = await conn.fetchrow(
                 """
-                SELECT credential_key, metadata
+                SELECT credential_key, credential_ciphertext, key_version, metadata
                 FROM tenant_credentials
                 WHERE tenant_id = $1 AND credential_type = $2
                 """,
@@ -157,6 +157,8 @@ async def get_tenant_credentials(tenant_id: str, credential_type: str) -> dict[s
             metadata = {}
     return {
         "credential_key": row["credential_key"],
+        "credential_ciphertext": row["credential_ciphertext"],
+        "key_version": row["key_version"],
         "metadata": metadata or {},
     }
 

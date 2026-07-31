@@ -15,6 +15,7 @@ dependencies = [
   "anyio>=4.3.0",
   "msal>=1.28.0",
   "python-jose[cryptography]>=3.3.0",
+  "cryptography>=42.0.0",
 ]
 
 [project.optional-dependencies]
@@ -32,7 +33,7 @@ requires = ["setuptools>=68"]
 build-backend = "setuptools.build_meta"
 
 [tool.setuptools.packages.find]
-include = ["agents*"]
+include = ["agents*", "portal*"]
 
 [tool.ruff]
 line-length = 100

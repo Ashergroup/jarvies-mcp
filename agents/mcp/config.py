@@ -68,6 +68,8 @@ class MCPSettings(BaseSettings):
     )
     # Secret used to sign Jarvies-issued access tokens (HS256).
     jarvies_token_secret: str = Field(default="", validation_alias="JARVIES_TOKEN_SECRET")
+    # Fernet key for encrypting tenant_credentials at rest (portal, Phase 3).
+    jarvies_encryption_key: str = Field(default="", validation_alias="JARVIES_ENCRYPTION_KEY")
     # Optional override for the OAuth issuer / discovery base URL. When empty the
     # URL is derived from the incoming request.
     public_base_url: str = Field(default="", validation_alias="JARVIES_PUBLIC_URL")
@@ -185,6 +187,12 @@ class MCPSettings(BaseSettings):
         """Return True when the server is running in production mode."""
 
         return self.environment == "production"
+
+    @property
+    def encryption_configured(self) -> bool:
+        """Return True when a Fernet encryption key is configured."""
+
+        return bool(self.jarvies_encryption_key)
 
     @property
     def allowed_host_values(self) -> list[str]:

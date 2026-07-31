@@ -270,6 +270,38 @@ Safety controls:
 
 Use a dedicated PostgreSQL read-only user for `DATABASE_URL`.
 
+## Credential encryption
+
+Per-tenant secrets in `tenant_credentials` are encrypted at rest with Fernet.
+`JARVIES_ENCRYPTION_KEY` (a urlsafe-base64 Fernet key) is **required in
+production**. Generate one with:
+
+```powershell
+python -c "from cryptography.fernet import Fernet; print(Fernet.generate_key().decode())"
+```
+
+New and updated rows are written encrypted (`credential_ciphertext` +
+`key_version`, with `credential_key` NULL). Legacy plaintext rows written before
+encryption was enabled remain readable until migrated by the one-shot script.
+
+Deploy order:
+
+1. Deploy the code that supports encryption (Day 2+).
+2. Set `JARVIES_ENCRYPTION_KEY` in the environment.
+3. `python scripts/reencrypt_credentials.py --dry-run` — review the plan.
+4. `python scripts/reencrypt_credentials.py --execute` — migrate legacy rows.
+
+The migration is manual-only (never auto-run from startup or `migrate.py`), runs
+inside a single transaction, and NULLs `credential_key` per row as it encrypts.
+It does not drop the `credential_key` column — that waits for a future release
+once every environment is migrated.
+
+**Fail-loud:** once a row is stored as ciphertext, reading it requires the key.
+If `JARVIES_ENCRYPTION_KEY` is missing or wrong, credential resolution raises
+(`CryptoNotConfiguredError` / `CryptoDecryptError`) and the affected tool call
+returns an error — it is **not** downgraded to a `not_configured` result. A
+misconfigured key surfaces loudly rather than silently serving no credential.
+
 ## Deferred / future work
 
 - `xero_create_invoice` — write path (draft invoices only, not authorised). FinPilot Day 5 work item.

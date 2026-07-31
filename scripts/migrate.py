@@ -104,6 +104,56 @@ DDL_STATEMENTS = [
     "ALTER TABLE tenants ADD COLUMN IF NOT EXISTS plan TEXT",
     "ALTER TABLE tenants ADD COLUMN IF NOT EXISTS consented_at TIMESTAMPTZ",
     "ALTER TABLE tenants ADD COLUMN IF NOT EXISTS status TEXT DEFAULT 'active'",
+    # Portal schema (Phase 3). Mirrors agents.mcp.portal_schema.PORTAL_DDL_STATEMENTS,
+    # which also applies these idempotently at server startup. Kept inline here so
+    # this script stays standalone (no agents.* import).
+    "ALTER TABLE users ADD COLUMN IF NOT EXISTS role TEXT DEFAULT 'member'",
+    "ALTER TABLE users ADD COLUMN IF NOT EXISTS permissions JSONB DEFAULT '[]'::jsonb",
+    "ALTER TABLE users ADD COLUMN IF NOT EXISTS is_active BOOLEAN DEFAULT true",
+    "ALTER TABLE users ADD COLUMN IF NOT EXISTS invited_by UUID REFERENCES users(id)",
+    "ALTER TABLE users ADD COLUMN IF NOT EXISTS invited_at TIMESTAMPTZ",
+    """
+    CREATE TABLE IF NOT EXISTS licenses (
+        id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+        tenant_id UUID REFERENCES tenants(id),
+        plan TEXT,
+        seat_count INT DEFAULT 1,
+        starts_at TIMESTAMPTZ DEFAULT now(),
+        ends_at TIMESTAMPTZ,
+        status TEXT DEFAULT 'active',
+        notes TEXT,
+        created_at TIMESTAMPTZ DEFAULT now(),
+        created_by TEXT
+    )
+    """,
+    "CREATE INDEX IF NOT EXISTS idx_licenses_tenant ON licenses(tenant_id)",
+    """
+    CREATE TABLE IF NOT EXISTS audit_log (
+        id BIGSERIAL PRIMARY KEY,
+        tenant_id UUID REFERENCES tenants(id) ON DELETE SET NULL,
+        actor_type TEXT NOT NULL,
+        actor_id TEXT NOT NULL,
+        action TEXT NOT NULL,
+        target_type TEXT,
+        target_id TEXT,
+        metadata JSONB,
+        created_at TIMESTAMPTZ DEFAULT now()
+    )
+    """,
+    "CREATE INDEX IF NOT EXISTS idx_audit_tenant_created "
+    "ON audit_log(tenant_id, created_at DESC)",
+    """
+    CREATE TABLE IF NOT EXISTS connector_installs (
+        tenant_id UUID REFERENCES tenants(id) ON DELETE CASCADE,
+        connector_key TEXT NOT NULL,
+        enabled BOOLEAN DEFAULT true,
+        installed_at TIMESTAMPTZ DEFAULT now(),
+        installed_by TEXT,
+        PRIMARY KEY (tenant_id, connector_key)
+    )
+    """,
+    "ALTER TABLE tenant_credentials ADD COLUMN IF NOT EXISTS credential_ciphertext BYTEA",
+    "ALTER TABLE tenant_credentials ADD COLUMN IF NOT EXISTS key_version INT DEFAULT 1",
 ]
 
 

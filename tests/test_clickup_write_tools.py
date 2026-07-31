@@ -557,3 +557,105 @@ async def test_list_tasks_by_id_error(monkeypatch: pytest.MonkeyPatch) -> None:
 
     assert result["status"] == "error"
     assert result["code"] == 404
+
+
+# ---------------------------------------------------------------------------
+# 11. clickup_create_task
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_create_task_happy_path(monkeypatch: pytest.MonkeyPatch) -> None:
+    _set_env(monkeypatch)
+    with respx.mock(assert_all_called=True) as mock:
+        route = mock.post(f"{BASE}/list/ls1/task").mock(
+            return_value=httpx.Response(
+                200,
+                json={"id": "tk9", "name": "Acme grant", "url": "https://clickup/tk9"},
+            )
+        )
+        result = await cwt.clickup_create_task(
+            list_id="ls1",
+            name="Acme grant",
+            description="Renewal application",
+            status="ACTIVE",
+            due_date_ms=1735689600000,
+            permissions=PERMS,
+        )
+
+    assert result["status"] == "ok"
+    assert result["task_id"] == "tk9"
+    assert result["name"] == "Acme grant"
+    assert result["url"] == "https://clickup/tk9"
+    body = route.calls[0].request.content.decode()
+    assert "Acme grant" in body
+    assert "Renewal application" in body
+    assert "ACTIVE" in body
+    assert "1735689600000" in body
+    # ClickUp v2 uses a raw token, NOT Bearer.
+    assert route.calls[0].request.headers["authorization"] == "tok-do-not-log"
+
+
+@pytest.mark.asyncio
+async def test_create_task_name_only_omits_optional_fields(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _set_env(monkeypatch)
+    with respx.mock(assert_all_called=True) as mock:
+        route = mock.post(f"{BASE}/list/ls1/task").mock(
+            return_value=httpx.Response(200, json={"id": "tk1", "name": "Bare"})
+        )
+        result = await cwt.clickup_create_task(
+            list_id="ls1", name="Bare", permissions=PERMS
+        )
+
+    assert result["status"] == "ok"
+    assert result["task_id"] == "tk1"
+    body = route.calls[0].request.content.decode()
+    assert "status" not in body
+    assert "due_date" not in body
+    assert "description" not in body
+
+
+@pytest.mark.asyncio
+async def test_create_task_requires_name(monkeypatch: pytest.MonkeyPatch) -> None:
+    _set_env(monkeypatch)
+    result = await cwt.clickup_create_task(list_id="ls1", name="", permissions=PERMS)
+    assert result["status"] == "error"
+    assert result["code"] == 400
+
+
+@pytest.mark.asyncio
+async def test_create_task_requires_list_id(monkeypatch: pytest.MonkeyPatch) -> None:
+    _set_env(monkeypatch)
+    result = await cwt.clickup_create_task(list_id="", name="X", permissions=PERMS)
+    assert result["status"] == "error"
+    assert result["code"] == 400
+
+
+@pytest.mark.asyncio
+async def test_create_task_write_denied_for_read_only(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _set_env(monkeypatch)
+    with pytest.raises(MCPPermissionError):
+        await cwt.clickup_create_task(
+            list_id="ls1",
+            name="X",
+            permissions=["fundraising_access", "read_only"],
+        )
+
+
+@pytest.mark.asyncio
+async def test_create_task_error(monkeypatch: pytest.MonkeyPatch) -> None:
+    _set_env(monkeypatch)
+    with respx.mock(assert_all_called=True) as mock:
+        mock.post(f"{BASE}/list/ls1/task").mock(
+            return_value=httpx.Response(400, json={"err": "Status not found"})
+        )
+        result = await cwt.clickup_create_task(
+            list_id="ls1", name="X", status="BOGUS", permissions=PERMS
+        )
+
+    assert result["status"] == "error"
+    assert result["code"] == 400

@@ -143,6 +143,9 @@ TOOL_POLICIES: dict[str, ToolPolicy] = {
     "clickup_create_form": ToolPolicy(
         required_any={"fundraising_access"}, write=True
     ),
+    "clickup_create_task": ToolPolicy(
+        required_any={"fundraising_access"}, write=True
+    ),
 }
 
 
