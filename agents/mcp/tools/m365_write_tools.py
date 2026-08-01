@@ -40,7 +40,7 @@ import httpx
 from agents.mcp.config import get_settings
 from agents.mcp.database import get_conn
 from agents.mcp.permissions import check_permission
-from agents.mcp.tenant import current_user_id
+from agents.mcp.tenant import current_tenant, current_user_id
 from agents.mcp.tenant_context import build_tenant_context, use_tenant_context
 
 log = logging.getLogger(__name__)
@@ -49,6 +49,20 @@ GRAPH_BASE = "https://graph.microsoft.com/v1.0"
 
 # Returned when no Microsoft access token can be resolved for a tool call.
 _NO_TOKEN_MESSAGE = "No M365 access token available — please reconnect via OAuth"
+
+
+class M365IdentityError(RuntimeError):
+    """Raised when the caller's mailbox identity cannot be resolved.
+
+    Every mailbox Graph call must target ``/users/{upn}/...``. The previous
+    behaviour fell back to ``/me/`` whenever resolution failed, which resolves
+    whichever mailbox owns the access token — not necessarily the user the
+    request claims to act for. That is unsafe under multi-tenant, so resolution
+    failure is now terminal.
+
+    The message always begins with a stable ``m365_upn_*`` code matching the
+    log event, so the failure mode is identifiable from either side.
+    """
 
 # Microsoft identity-platform token endpoint (per-tenant). Used to refresh an
 # expired delegated access token from a stored refresh token.
@@ -304,7 +318,7 @@ async def _get_m365_token(
     return await _lookup_user_token(effective_user_id)
 
 
-async def _get_upn(user_id: str | None) -> str | None:
+async def _get_upn(user_id: str | None) -> str:
     """Resolve the signed-in user's UPN (email) for `/users/{upn}/...` paths.
 
     Every M365 mailbox/calendar/chat Graph call must target `/users/{upn}/...`
@@ -316,40 +330,89 @@ async def _get_upn(user_id: str | None) -> str | None:
 
     The user is resolved the same way as ``_get_m365_token``: the request's
     bearer-token identity (``tenant.current_user_id``), or an explicit
-    non-default ``user_id``. The email is then read from the ``users`` table.
+    non-default ``user_id``. Both are ``users.id`` — the internal Jarvies UUID
+    minted by ``oauth._persist_identity`` and carried as the token's ``sub``
+    claim — which is why the lookup keys on ``users.id`` and not on
+    ``microsoft_user_id``.
 
-    Returns the email string, or None when no user identity is available, the
-    lookup fails, or the row has no email. A None return is logged as a warning
-    because callers then fall back to `/me/`, which reintroduces the
-    cross-mailbox-context risk this helper exists to remove.
+    The lookup is scoped to the request's tenant (``tenant.current_tenant``,
+    itself resolved from the token's verified ``tenant_id`` claim), so a valid
+    user UUID belonging to another tenant cannot resolve a mailbox here.
+
+    Raises:
+        M365IdentityError: On every resolution failure. Never returns None and
+            never falls back to `/me/`. The message carries a distinct
+            ``m365_upn_*`` code per failure mode, matching the log event.
     """
 
     effective_user_id = current_user_id()
     if not effective_user_id and user_id and user_id != get_settings().default_user_id:
         effective_user_id = user_id
     if not effective_user_id:
-        log.warning("m365_upn_no_identity — falling back to /me/")
-        return None
+        log.warning("m365_upn_no_identity")
+        raise M365IdentityError(
+            "m365_upn_no_identity: no authenticated user identity on this request. "
+            "Call via a Jarvies OAuth bearer token, or pass an explicit user_id "
+            "that differs from MCP_DEFAULT_USER_ID."
+        )
+
+    tenant = current_tenant()
+    tenant_row_id = tenant.get("id") if tenant else None
+    if not tenant_row_id:
+        log.warning("m365_upn_no_tenant", extra={"user_id": effective_user_id})
+        raise M365IdentityError(
+            "m365_upn_no_tenant: no resolved tenant on this request, so the users "
+            "lookup cannot be tenant-scoped. Call via a Jarvies OAuth bearer token "
+            "carrying a tenant_id claim for an active tenant."
+        )
 
     try:
         async with get_conn() as conn:
             row = await conn.fetchrow(
-                "SELECT email FROM users WHERE id::text = $1",
-                effective_user_id,
+                "SELECT email FROM users WHERE id::text = $1 AND tenant_id::text = $2",
+                str(effective_user_id),
+                str(tenant_row_id),
             )
-    except Exception:
-        log.warning("m365_upn_lookup_failed — falling back to /me/")
-        return None
-    if row is None or not row["email"]:
-        log.warning("m365_upn_not_found — falling back to /me/")
-        return None
+    except Exception as exc:
+        log.warning(
+            "m365_upn_lookup_failed",
+            extra={"user_id": effective_user_id, "error": exc.__class__.__name__},
+        )
+        raise M365IdentityError(
+            "m365_upn_lookup_failed: the users lookup raised "
+            f"{exc.__class__.__name__}; cannot resolve the mailbox."
+        ) from exc
+    if row is None:
+        log.warning(
+            "m365_upn_not_found",
+            extra={"user_id": effective_user_id, "tenant_id": tenant_row_id},
+        )
+        raise M365IdentityError(
+            "m365_upn_not_found: no users row matches this user_id within this "
+            "tenant. The identity may belong to a different tenant."
+        )
+    if not row["email"]:
+        log.warning("m365_upn_no_email", extra={"user_id": effective_user_id})
+        raise M365IdentityError(
+            "m365_upn_no_email: the users row has no email, so no "
+            "/users/{upn} path can be built. Re-run the OAuth consent flow to "
+            "repopulate it from the id_token claims."
+        )
     return row["email"]
 
 
-def _mailbox_base(upn: str | None) -> str:
-    """Build the Graph mailbox base path: `/users/{upn}` or `/me` fallback."""
+def _mailbox_base(upn: str) -> str:
+    """Build the Graph mailbox base path. Always `/users/{upn}` — never `/me`.
 
-    return f"/users/{upn}" if upn else "/me"
+    `/me` is deliberately unreachable: it resolves to the access token's owner,
+    which is not guaranteed to be the user the request claims to act for.
+    """
+
+    if not upn:
+        raise M365IdentityError(
+            "m365_upn_empty: _mailbox_base requires a UPN; refusing to build /me."
+        )
+    return f"/users/{upn}"
 
 
 async def _retry_on_401(context: Any, token: str, attempt: Any) -> Any:
@@ -552,7 +615,10 @@ async def m365_send_email(
             ]
         payload = {"message": message, "saveToSentItems": True}
 
-        mbox = _mailbox_base(await _get_upn(context.user_id))
+        try:
+            mbox = _mailbox_base(await _get_upn(context.user_id))
+        except M365IdentityError as exc:
+            return _err(str(exc))
 
         async def _attempt(tok: str) -> dict[str, Any]:
             return await _graph_request("POST", f"{mbox}/sendMail", tok, json=payload)
@@ -629,7 +695,10 @@ async def m365_create_calendar_event(
             event["isOnlineMeeting"] = True
             event["onlineMeetingProvider"] = "teamsForBusiness"
 
-        mbox = _mailbox_base(await _get_upn(context.user_id))
+        try:
+            mbox = _mailbox_base(await _get_upn(context.user_id))
+        except M365IdentityError as exc:
+            return _err(str(exc))
 
         async def _attempt(tok: str) -> dict[str, Any]:
             return await _graph_request("POST", f"{mbox}/events", tok, json=event)

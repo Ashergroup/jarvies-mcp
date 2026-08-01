@@ -6,6 +6,7 @@ import respx
 
 from agents.mcp import config as mcp_config
 from agents.mcp.tools import m365_mail_folder_tools as mft
+from agents.mcp.tools.m365_write_tools import M365IdentityError
 
 GRAPH = "https://graph.microsoft.com/v1.0"
 PERMS = ["m365_access"]
@@ -378,20 +379,47 @@ async def test_missing_token_returns_error() -> None:
 
 
 @pytest.mark.asyncio
-async def test_falls_back_to_me_when_upn_unavailable(
+async def test_fails_closed_when_upn_unresolvable(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """When `_get_upn` can't resolve a UPN, calls fall back to /me/."""
+    """When `_get_upn` can't resolve a UPN the call fails — it never hits /me/.
+
+    Inverted from the previous `test_falls_back_to_me_when_upn_unavailable`.
+    /me/ resolves to whichever mailbox owns the access token, so falling back
+    silently targeted the wrong mailbox under multi-tenant.
+    """
+
+    async def raises_identity(user_id: str | None = None) -> str:
+        raise M365IdentityError("m365_upn_not_found: no users row for this tenant")
+
+    monkeypatch.setattr(mft, "_get_upn", raises_identity)
+    with respx.mock(assert_all_called=False) as mock:
+        me = mock.get(f"{GRAPH}/me/mailFolders").mock(
+            return_value=httpx.Response(200, json={"value": []})
+        )
+        result = await mft.m365_list_mail_folders(access_token=TOKEN, permissions=PERMS)
+
+    assert result["status"] == "error"
+    assert "m365_upn_not_found" in result["error"]
+    assert me.call_count == 0
+
+
+@pytest.mark.asyncio
+async def test_fails_closed_when_upn_resolver_returns_empty(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Defensive: a None/empty UPN still cannot construct /me/."""
 
     async def no_upn(user_id: str | None = None) -> None:
         return None
 
     monkeypatch.setattr(mft, "_get_upn", no_upn)
-    with respx.mock(assert_all_called=True) as mock:
-        route = mock.get(f"{GRAPH}/me/mailFolders").mock(
+    with respx.mock(assert_all_called=False) as mock:
+        me = mock.get(f"{GRAPH}/me/mailFolders").mock(
             return_value=httpx.Response(200, json={"value": []})
         )
         result = await mft.m365_list_mail_folders(access_token=TOKEN, permissions=PERMS)
 
-    assert result["status"] == "ok"
-    assert route.called
+    assert result["status"] == "error"
+    assert "m365_upn_empty" in result["error"]
+    assert me.call_count == 0

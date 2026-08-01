@@ -30,6 +30,7 @@ from agents.mcp.permissions import check_permission
 from agents.mcp.tenant_context import use_tenant_context
 from agents.mcp.tools.m365_write_tools import (
     _NO_TOKEN_MESSAGE,
+    M365IdentityError,
     _context,
     _err,
     _get_m365_token,
@@ -152,7 +153,10 @@ async def m365_search_emails(
         if not sender and not query:
             params["$orderby"] = "receivedDateTime desc"
 
-        mbox = _mailbox_base(await _get_upn(context.user_id))
+        try:
+            mbox = _mailbox_base(await _get_upn(context.user_id))
+        except M365IdentityError as exc:
+            return _err(str(exc))
         try:
             data = await _graph_request(
                 "GET",
@@ -201,7 +205,10 @@ async def m365_read_email(
             return _err(f"Not an email URI: {uri}")
         msg_id = uri.removeprefix("mail:///messages/")
 
-        mbox = _mailbox_base(await _get_upn(context.user_id))
+        try:
+            mbox = _mailbox_base(await _get_upn(context.user_id))
+        except M365IdentityError as exc:
+            return _err(str(exc))
         try:
             m = await _graph_request(
                 "GET",
@@ -279,7 +286,10 @@ async def m365_search_calendar(
         if filters:
             params["$filter"] = " and ".join(filters)
 
-        mbox = _mailbox_base(await _get_upn(context.user_id))
+        try:
+            mbox = _mailbox_base(await _get_upn(context.user_id))
+        except M365IdentityError as exc:
+            return _err(str(exc))
         try:
             data = await _graph_request("GET", f"{mbox}/events", token, params=params)
         except httpx.HTTPStatusError as exc:
@@ -439,7 +449,10 @@ async def m365_create_email_draft(
                 {"name": "x-in-reply-to-uri", "value": in_reply_to_uri}
             ]
 
-        mbox = _mailbox_base(await _get_upn(context.user_id))
+        try:
+            mbox = _mailbox_base(await _get_upn(context.user_id))
+        except M365IdentityError as exc:
+            return _err(str(exc))
         try:
             created = await _graph_request(
                 "POST", f"{mbox}/messages", token, json=message

@@ -43,6 +43,7 @@ from agents.mcp.tenant_context import use_tenant_context
 from agents.mcp.tools.m365_tools import _strip_html_to_preview
 from agents.mcp.tools.m365_write_tools import (
     _NO_TOKEN_MESSAGE,
+    M365IdentityError,
     _context,
     _encode_share_url,
     _err,
@@ -95,7 +96,10 @@ async def m365_list_mail_folders(
         if not token:
             return _err(_NO_TOKEN_MESSAGE)
 
-        mbox = _mailbox_base(await _get_upn(context.user_id))
+        try:
+            mbox = _mailbox_base(await _get_upn(context.user_id))
+        except M365IdentityError as exc:
+            return _err(str(exc))
         try:
             data = await _graph_request(
                 "GET", f"{mbox}/mailFolders", token, params={"$top": 50}
@@ -144,7 +148,10 @@ async def m365_create_mail_folder(
         if not folder_name:
             return _err("folder_name is required")
 
-        mbox = _mailbox_base(await _get_upn(context.user_id))
+        try:
+            mbox = _mailbox_base(await _get_upn(context.user_id))
+        except M365IdentityError as exc:
+            return _err(str(exc))
         path = (
             f"{mbox}/mailFolders/{parent_folder_id}/childFolders"
             if parent_folder_id
@@ -207,7 +214,10 @@ async def m365_move_email(
             return _err("destination_folder_id is required")
         msg_id = message_uri.removeprefix("mail:///messages/")
 
-        mbox = _mailbox_base(await _get_upn(context.user_id))
+        try:
+            mbox = _mailbox_base(await _get_upn(context.user_id))
+        except M365IdentityError as exc:
+            return _err(str(exc))
         try:
             moved = await _graph_request(
                 "POST",
@@ -333,7 +343,10 @@ async def m365_search_teams_chat(
         size = max(1, int(limit))
         needle = query.lower()
 
-        mbox = _mailbox_base(await _get_upn(context.user_id))
+        try:
+            mbox = _mailbox_base(await _get_upn(context.user_id))
+        except M365IdentityError as exc:
+            return _err(str(exc))
         try:
             chats_data = await _graph_request(
                 "GET", f"{mbox}/chats", token, params={"$expand": "members"}

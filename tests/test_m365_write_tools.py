@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+from contextlib import contextmanager
 from datetime import UTC, datetime, timedelta
 
 import httpx
@@ -910,92 +911,256 @@ async def test_send_email_stops_after_one_retry_on_repeated_401(
 
 
 # ---------------------------------------------------------------------------
-# _get_upn helper — UPN resolution from the users table (#8B)
+# _get_upn helper — tenant-scoped UPN resolution, fail-closed (#8B, c-i + c-iii)
+#
+# `_get_upn` never returns None and never falls back to /me/. Every resolution
+# failure raises M365IdentityError carrying a distinct `m365_upn_*` code, and
+# the users lookup is scoped to the request's tenant so a valid user UUID from
+# another tenant cannot resolve a mailbox.
 # ---------------------------------------------------------------------------
+
+TENANT_ROW_ID = "33333333-3333-3333-3333-333333333333"
+OTHER_TENANT_ROW_ID = "44444444-4444-4444-4444-444444444444"
 
 
 class _FakeRowConn:
-    def __init__(self, row: dict | None) -> None:
-        self._row = row
+    """Fake conn keyed on (user_id, tenant_id), asserting the tenant predicate.
+
+    A key miss returns None exactly as asyncpg does, which is what the
+    cross-tenant rejection test relies on.
+    """
+
+    def __init__(self, rows: dict[tuple[str, str], dict | None] | None = None) -> None:
+        self._rows = rows or {}
+        self.calls: list[tuple] = []
 
     async def fetchrow(self, query: str, *args) -> dict | None:
         assert "SELECT email FROM users" in query
-        return self._row
+        # The tenant predicate must be present — this is the (c-iii) guard.
+        assert "tenant_id::text = $2" in query
+        self.calls.append(args)
+        return self._rows.get((args[0], args[1]))
 
 
 class _FakeRowConnCtx:
-    def __init__(self, row: dict | None) -> None:
-        self._row = row
+    def __init__(self, conn: _FakeRowConn) -> None:
+        self._conn = conn
 
     async def __aenter__(self) -> _FakeRowConn:
-        return _FakeRowConn(self._row)
+        return self._conn
 
     async def __aexit__(self, *exc) -> bool:
         return False
 
 
+@contextmanager
+def _identity(user_id: str | None, tenant_row_id: str | None):
+    """Publish a user + tenant on the request context vars, then restore both."""
+
+    user_token = mcp_tenant.set_current_user_id(user_id)
+    tenant = {"id": tenant_row_id, "is_active": True} if tenant_row_id else None
+    tenant_token = mcp_tenant.set_current_tenant(tenant)
+    try:
+        yield
+    finally:
+        mcp_tenant.reset_current_tenant(tenant_token)
+        mcp_tenant.reset_current_user_id(user_token)
+
+
+def _conn_with(
+    monkeypatch: pytest.MonkeyPatch, rows: dict[tuple[str, str], dict | None]
+) -> _FakeRowConn:
+    conn = _FakeRowConn(rows)
+    monkeypatch.setattr(m365_write_tools, "get_conn", lambda: _FakeRowConnCtx(conn))
+    return conn
+
+
+# --- happy path -------------------------------------------------------------
+
+
 @pytest.mark.asyncio
-async def test_get_upn_returns_email_from_context(
+async def test_get_upn_returns_email_for_user_in_tenant(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    monkeypatch.setattr(
-        m365_write_tools, "get_conn", lambda: _FakeRowConnCtx({"email": UPN})
-    )
-    token = mcp_tenant.set_current_user_id(REAL_USER_ID)
-    try:
+    conn = _conn_with(monkeypatch, {(REAL_USER_ID, TENANT_ROW_ID): {"email": UPN}})
+    with _identity(REAL_USER_ID, TENANT_ROW_ID):
         result = await m365_write_tools._get_upn("local-user")
-    finally:
-        mcp_tenant.reset_current_user_id(token)
     assert result == UPN
+    # Lookup was tenant-scoped with both bind params, in order.
+    assert conn.calls == [(REAL_USER_ID, TENANT_ROW_ID)]
 
 
 @pytest.mark.asyncio
 async def test_get_upn_uses_explicit_non_default_user_id(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    monkeypatch.setattr(
-        m365_write_tools, "get_conn", lambda: _FakeRowConnCtx({"email": UPN})
-    )
-    result = await m365_write_tools._get_upn(REAL_USER_ID)
+    # No bearer identity; an explicit non-placeholder user_id is honoured. The
+    # tenant still has to come from the request context.
+    _conn_with(monkeypatch, {(REAL_USER_ID, TENANT_ROW_ID): {"email": UPN}})
+    with _identity(None, TENANT_ROW_ID):
+        result = await m365_write_tools._get_upn(REAL_USER_ID)
     assert result == UPN
 
 
+# --- fail-closed paths, one per m365_upn_* code -----------------------------
+
+
 @pytest.mark.asyncio
-async def test_get_upn_none_and_warns_when_not_found(
+async def test_get_upn_raises_when_no_identity(
     monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
 ) -> None:
-    monkeypatch.setattr(
-        m365_write_tools, "get_conn", lambda: _FakeRowConnCtx(None)
-    )
+    """Path 1: placeholder user, no bearer identity → no DB lookup at all."""
+
+    monkeypatch.setenv("MCP_DEFAULT_USER_ID", "local-user")
+    mcp_config.get_settings.cache_clear()
     caplog.set_level(logging.WARNING, logger="agents.mcp.tools.m365_write_tools")
-    result = await m365_write_tools._get_upn(REAL_USER_ID)
-    assert result is None
-    assert any("falling back to /me/" in r.getMessage() for r in caplog.records)
+    with (
+        _identity(None, TENANT_ROW_ID),
+        pytest.raises(m365_write_tools.M365IdentityError) as exc,
+    ):
+        await m365_write_tools._get_upn("local-user")
+    assert "m365_upn_no_identity" in str(exc.value)
+    assert any("m365_upn_no_identity" in r.getMessage() for r in caplog.records)
 
 
 @pytest.mark.asyncio
-async def test_get_upn_none_and_warns_when_no_identity(
+async def test_get_upn_raises_when_no_tenant(
     caplog: pytest.LogCaptureFixture,
 ) -> None:
-    # Default placeholder user, no auth context → no DB lookup, /me/ fallback.
+    """Path 2: user identity present but no tenant → lookup cannot be scoped."""
+
     caplog.set_level(logging.WARNING, logger="agents.mcp.tools.m365_write_tools")
-    result = await m365_write_tools._get_upn("local-user")
-    assert result is None
-    assert any("falling back to /me/" in r.getMessage() for r in caplog.records)
+    with (
+        _identity(REAL_USER_ID, None),
+        pytest.raises(m365_write_tools.M365IdentityError) as exc,
+    ):
+        await m365_write_tools._get_upn(REAL_USER_ID)
+    assert "m365_upn_no_tenant" in str(exc.value)
+    assert any("m365_upn_no_tenant" in r.getMessage() for r in caplog.records)
 
 
 @pytest.mark.asyncio
-async def test_get_upn_none_and_warns_on_db_error(
+async def test_get_upn_raises_on_db_error(
     monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
 ) -> None:
+    """Path 3: the lookup itself raises → terminal, not a fallback."""
+
     def boom():
         raise RuntimeError("db down")
 
     monkeypatch.setattr(m365_write_tools, "get_conn", boom)
     caplog.set_level(logging.WARNING, logger="agents.mcp.tools.m365_write_tools")
-    result = await m365_write_tools._get_upn(REAL_USER_ID)
-    assert result is None
-    assert any("falling back to /me/" in r.getMessage() for r in caplog.records)
+    with (
+        _identity(REAL_USER_ID, TENANT_ROW_ID),
+        pytest.raises(m365_write_tools.M365IdentityError) as exc,
+    ):
+        await m365_write_tools._get_upn(REAL_USER_ID)
+    assert "m365_upn_lookup_failed" in str(exc.value)
+    assert "RuntimeError" in str(exc.value)
+    assert any("m365_upn_lookup_failed" in r.getMessage() for r in caplog.records)
+
+
+@pytest.mark.asyncio
+async def test_get_upn_raises_when_row_not_found(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """Path 4: no row for this (user_id, tenant_id) pair."""
+
+    _conn_with(monkeypatch, {})
+    caplog.set_level(logging.WARNING, logger="agents.mcp.tools.m365_write_tools")
+    with (
+        _identity(REAL_USER_ID, TENANT_ROW_ID),
+        pytest.raises(m365_write_tools.M365IdentityError) as exc,
+    ):
+        await m365_write_tools._get_upn(REAL_USER_ID)
+    assert "m365_upn_not_found" in str(exc.value)
+    assert any("m365_upn_not_found" in r.getMessage() for r in caplog.records)
+
+
+@pytest.mark.asyncio
+async def test_get_upn_raises_when_row_has_no_email(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """Path 5: row exists but email is NULL — distinct from not-found."""
+
+    _conn_with(monkeypatch, {(REAL_USER_ID, TENANT_ROW_ID): {"email": None}})
+    caplog.set_level(logging.WARNING, logger="agents.mcp.tools.m365_write_tools")
+    with (
+        _identity(REAL_USER_ID, TENANT_ROW_ID),
+        pytest.raises(m365_write_tools.M365IdentityError) as exc,
+    ):
+        await m365_write_tools._get_upn(REAL_USER_ID)
+    assert "m365_upn_no_email" in str(exc.value)
+    assert any("m365_upn_no_email" in r.getMessage() for r in caplog.records)
+
+
+# --- cross-tenant rejection (c-iii) -----------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_get_upn_rejects_user_guid_from_another_tenant(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A valid user UUID presented under the wrong tenant must not resolve.
+
+    The row exists under TENANT_ROW_ID. Requesting it while the request context
+    carries OTHER_TENANT_ROW_ID must miss, because the predicate binds both.
+    Without the tenant clause this returned the other tenant's mailbox UPN.
+    """
+
+    conn = _conn_with(monkeypatch, {(REAL_USER_ID, TENANT_ROW_ID): {"email": UPN}})
+    with (
+        _identity(REAL_USER_ID, OTHER_TENANT_ROW_ID),
+        pytest.raises(m365_write_tools.M365IdentityError) as exc,
+    ):
+        await m365_write_tools._get_upn(REAL_USER_ID)
+    assert "m365_upn_not_found" in str(exc.value)
+    assert conn.calls == [(REAL_USER_ID, OTHER_TENANT_ROW_ID)]
+
+
+# --- /me/ is unreachable ----------------------------------------------------
+
+
+def test_mailbox_base_refuses_empty_upn() -> None:
+    """`_mailbox_base` can no longer construct /me under any input."""
+
+    assert m365_write_tools._mailbox_base(UPN) == USERS
+    for empty in ("", None):
+        with pytest.raises(m365_write_tools.M365IdentityError) as exc:
+            m365_write_tools._mailbox_base(empty)  # type: ignore[arg-type]
+        assert "m365_upn_empty" in str(exc.value)
+
+
+@pytest.mark.asyncio
+async def test_tool_returns_error_envelope_and_makes_no_graph_call(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An identity failure surfaces as a normal error envelope, not a raise.
+
+    Critically, no Graph request is attempted — the old code would have sent the
+    call to /me/ using whichever mailbox owns the token.
+    """
+
+    _conn_with(monkeypatch, {})
+    with respx.mock(assert_all_called=False) as mock:
+        me = mock.post(f"{GRAPH}/me/sendMail").mock(return_value=httpx.Response(202))
+        users = mock.post(f"{GRAPH}{USERS}/sendMail").mock(
+            return_value=httpx.Response(202)
+        )
+        with _identity(REAL_USER_ID, TENANT_ROW_ID):
+            result = await m365_write_tools.m365_send_email(
+                to=["a@nichegroup.africa"],
+                subject="s",
+                body="b",
+                user_id=REAL_USER_ID,
+                access_token=TOKEN,
+                permissions=PERMS,
+            )
+
+    assert result["status"] == "error"
+    assert "m365_upn_not_found" in result["error"]
+    assert me.call_count == 0
+    assert users.call_count == 0
 
 
 @pytest.mark.asyncio
