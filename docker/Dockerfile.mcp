@@ -16,7 +16,7 @@ COPY portal ./portal
 
 RUN pip install --no-cache-dir --upgrade pip \
     && pip install --no-cache-dir -e . \
-    && pip install --no-cache-dir "mcp[cli]"
+    && pip install --no-cache-dir "mcp[cli]>=1.9.0,<2"
 
 # Runtime data copied after the dependency layer so it stays cached when only
 # these change:
