@@ -49,10 +49,52 @@ STATIC_CLIENT_SECRET = ""
 
 # Microsoft authorize endpoint + scopes. Reserved OIDC scopes go in the raw
 # authorize redirect; MSAL adds them itself for the token exchange, so the MSAL
-# call uses only the resource scope.
+# call uses only the resource scopes.
 MS_AUTHORIZE_URL = "https://login.microsoftonline.com/common/oauth2/v2.0/authorize"
-MS_REDIRECT_SCOPE = "openid profile email offline_access User.Read"
-MSAL_SCOPES = ["User.Read"]
+
+# Delegated Microsoft Graph scopes requested at consent time.
+#
+# ── INVARIANT ─────────────────────────────────────────────────────────────────
+# This list MUST remain a superset of
+# ``m365_write_tools._REFRESH_SCOPE`` (minus offline_access). A refresh can only
+# return scopes that were consented here; asking for more yields AADSTS65001,
+# which used to be swallowed into a silent fallback to the older, narrower token
+# — the tool then 403s with no usable diagnostic.
+# Enforced by tests/test_oauth_scopes.py, not by comment.
+#
+# ── GATE 3, STAGES 1-3 (user consent only) ────────────────────────────────────
+# Every scope below is user-consentable, so no tenant administrator is needed to
+# roll this out. Verified against learn.microsoft.com/en-us/graph/
+# permissions-reference on 2026-08-02: Calendars.ReadWrite, ChannelMessage.Send,
+# and Chat.ReadWrite are documented "Admin consent required: No"; the Mail.* and
+# User.Read sections were not reachable in the fetched page and are expected to
+# be user-consent (the Azure portal shows the flag per permission when adding).
+#
+# ── DEFERRED (stages 4-5, each requires tenant ADMIN consent) ─────────────────
+#   Files.ReadWrite.All  — admin consent required (verified). Gates every
+#                          SharePoint/OneDrive tool.
+#   Channel.Create       — admin consent required (verified). Gates
+#                          m365_create_teams_channel only.
+#   Sites.ReadWrite.All  — admin consent required (verified), and NOT NEEDED:
+#                          no tool calls a /sites/ endpoint. Do not add it back
+#                          without a call site to justify it.
+# Adding any deferred scope here also requires adding it to _REFRESH_SCOPE and
+# granting the delegated permission on the Azure app registration.
+_GRAPH_DELEGATED_SCOPES = [
+    "User.Read",
+    "Mail.ReadWrite",
+    "Mail.Send",
+    "Calendars.ReadWrite",
+    "ChannelMessage.Send",
+    "Chat.ReadWrite",
+]
+
+MS_REDIRECT_SCOPE = " ".join(
+    ["openid", "profile", "email", "offline_access", *_GRAPH_DELEGATED_SCOPES]
+)
+# Reserved OIDC scopes are deliberately absent: MSAL injects openid/profile/
+# offline_access itself and rejects them when passed explicitly.
+MSAL_SCOPES = list(_GRAPH_DELEGATED_SCOPES)
 
 JARVIES_TOKEN_TTL_SECONDS = 28_800  # 8h
 PENDING_AUTH_TTL_SECONDS = 600  # 10 min

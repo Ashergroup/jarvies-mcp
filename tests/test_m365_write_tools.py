@@ -698,12 +698,15 @@ async def test_proactive_refresh_on_near_expiry(
 
     persisted: dict = {}
 
-    async def fake_persist(user_id, access_token, refresh_token, expires_in) -> None:
+    async def fake_persist(
+        user_id, access_token, refresh_token, expires_in, scope=None
+    ) -> None:
         persisted.update(
             user_id=user_id,
             access_token=access_token,
             refresh_token=refresh_token,
             expires_in=expires_in,
+            scope=scope,
         )
 
     monkeypatch.setattr(m365_write_tools, "_lookup_user_token_record", fake_record)
@@ -732,6 +735,8 @@ async def test_proactive_refresh_on_near_expiry(
         "access_token": "new-access",
         "refresh_token": "rt-2",
         "expires_in": 3600,
+        # Absent from this token response, so nothing overwrites the stored scope.
+        "scope": None,
     }
 
 
@@ -806,7 +811,7 @@ async def test_persist_refreshed_token_executes_update(
     monkeypatch.setattr(m365_write_tools, "get_conn", lambda: _FakeConnCtx(recorder))
 
     await m365_write_tools._persist_refreshed_token(
-        REAL_USER_ID, "new-access", "rt-2", 3600
+        REAL_USER_ID, "new-access", "rt-2", 3600, "Mail.Read Mail.Send"
     )
 
     assert len(recorder) == 1
@@ -815,7 +820,28 @@ async def test_persist_refreshed_token_executes_update(
     assert args[0] == "new-access"
     assert args[1] == "rt-2"
     assert isinstance(args[2], datetime)
-    assert args[3] == REAL_USER_ID
+    # The granted scope is persisted (Gate 3): the column was previously
+    # write-once-never-read, which made a narrowed grant undetectable.
+    assert args[3] == "Mail.Read Mail.Send"
+    assert "scope = COALESCE($4, scope)" in query
+    assert args[4] == REAL_USER_ID
+
+
+@pytest.mark.asyncio
+async def test_persist_refreshed_token_keeps_existing_scope_when_omitted(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A token response without a scope field must not blank the stored scope."""
+
+    recorder: list = []
+    monkeypatch.setattr(m365_write_tools, "get_conn", lambda: _FakeConnCtx(recorder))
+
+    await m365_write_tools._persist_refreshed_token(
+        REAL_USER_ID, "new-access", "rt-2", 3600
+    )
+
+    _query, args = recorder[0]
+    assert args[3] is None  # COALESCE leaves the stored value in place
 
 
 @pytest.mark.asyncio

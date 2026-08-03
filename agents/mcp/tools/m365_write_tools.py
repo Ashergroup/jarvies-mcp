@@ -68,11 +68,23 @@ class M365IdentityError(RuntimeError):
 # expired delegated access token from a stored refresh token.
 _MS_TOKEN_URL = "https://login.microsoftonline.com/{tenant}/oauth2/v2.0/token"
 
-# Delegated scopes requested on refresh — the write/read surface this module
-# needs, plus offline_access so Microsoft keeps issuing refresh tokens.
+# Delegated scopes requested on refresh — the surface this module and
+# m365_tools.py need, plus offline_access so Microsoft keeps issuing refresh
+# tokens.
+#
+# ── INVARIANT ─────────────────────────────────────────────────────────────────
+# Must stay a SUBSET of oauth.MS_REDIRECT_SCOPE (offline_access excepted).
+# Requesting a scope that was never consented returns AADSTS65001 on refresh.
+# Enforced by tests/test_oauth_scopes.py.
+#
+# Gate 3 stages 1-3 only. Files.ReadWrite.All, Sites.ReadWrite.All, and
+# Channel.Create are deliberately absent — see the deferred block in oauth.py.
+# Consequence while deferred: every SharePoint/OneDrive tool and
+# m365_create_teams_channel will receive Graph 403. That is the intended staged
+# state, not a regression.
 _REFRESH_SCOPE = (
-    "offline_access Mail.ReadWrite Mail.Send Calendars.ReadWrite "
-    "Files.ReadWrite.All Sites.ReadWrite.All ChannelMessage.Send Chat.ReadWrite"
+    "offline_access User.Read Mail.ReadWrite Mail.Send Calendars.ReadWrite "
+    "ChannelMessage.Send Chat.ReadWrite"
 )
 
 # Refresh proactively once the stored token is within this window of expiry.
@@ -141,7 +153,7 @@ async def _lookup_user_token_record(user_id: str) -> dict[str, Any] | None:
     try:
         async with get_conn() as conn:
             row = await conn.fetchrow(
-                "SELECT access_token, refresh_token, expires_at FROM user_tokens "
+                "SELECT access_token, refresh_token, expires_at, scope FROM user_tokens "
                 "WHERE user_id::text = $1 ORDER BY updated_at DESC LIMIT 1",
                 user_id,
             )
@@ -151,6 +163,64 @@ async def _lookup_user_token_record(user_id: str) -> dict[str, Any] | None:
     if row is None:
         return None
     return dict(row)
+
+
+async def _clear_user_token(user_id: str) -> None:
+    """Null the stored Microsoft tokens for a user, forcing re-consent.
+
+    Called when Microsoft reports that the stored grant cannot satisfy
+    ``_REFRESH_SCOPE`` (AADSTS65001 / invalid_grant). Leaving the row intact
+    would let every later call retry the same doomed refresh, fall back to the
+    narrower access token, and 403 against Graph with no usable diagnostic —
+    which is exactly how this defect stayed invisible.
+
+    The row is kept (rather than deleted) so ``users`` foreign keys and any audit
+    trail survive; ``_lookup_user_token``/``_lookup_user_token_record`` both treat
+    a NULL access token as "no token", so the next call returns
+    ``_NO_TOKEN_MESSAGE`` and the user is driven back through /authorize.
+
+    Never raises: a failed clear is logged and swallowed, exactly like
+    ``_persist_refreshed_token``. Token values are never logged.
+    """
+
+    try:
+        async with get_conn() as conn:
+            await conn.execute(
+                """
+                UPDATE user_tokens
+                SET access_token = NULL, refresh_token = NULL, expires_at = NULL,
+                    scope = NULL, updated_at = NOW()
+                WHERE user_id::text = $1
+                """,
+                user_id,
+            )
+        log.info("m365_token_cleared_for_reconsent", extra={"user_id": user_id})
+    except Exception:
+        log.warning(
+            "m365_token_clear_failed — the stale grant is still stored and will "
+            "keep failing until it is cleared manually",
+            extra={"user_id": user_id},
+        )
+
+
+def _missing_scopes(stored_scope: str | None) -> list[str]:
+    """Scopes in ``_REFRESH_SCOPE`` absent from a stored grant.
+
+    Empty when nothing is missing, or when ``stored_scope`` is NULL/blank — a row
+    predating scope persistence tells us nothing, and treating unknown as narrow
+    would log a false alarm on every legacy row. Comparison is case-insensitive
+    because Microsoft echoes scopes back with its own casing.
+    """
+
+    if not stored_scope or not stored_scope.strip():
+        return []
+    granted = {s.lower() for s in stored_scope.split()}
+    required = {s.lower() for s in _REFRESH_SCOPE.split()}
+    # offline_access is not always echoed in the granted scope string even when
+    # a refresh token was issued, so its absence is not evidence of narrowness.
+    required.discard("offline_access")
+    missing = required - granted
+    return sorted(missing)
 
 
 def _token_is_stale(expires_at: datetime | None) -> bool:
@@ -166,6 +236,7 @@ async def _persist_refreshed_token(
     access_token: str,
     refresh_token: str,
     expires_in: int | None,
+    scope: str | None = None,
 ) -> None:
     """Write a refreshed M365 token set back to ``user_tokens``.
 
@@ -173,6 +244,14 @@ async def _persist_refreshed_token(
     ``credentials.persist_xero_refresh_token``: best-effort, so any failure is
     logged and swallowed and the in-flight Graph call still proceeds with the
     new in-memory token. Token values are never logged.
+
+    ``scope`` is the scope string Microsoft ACTUALLY granted (from the token
+    response), not what we asked for. It is written so the stored grant can be
+    compared against ``_REFRESH_SCOPE`` on later calls — see ``_missing_scopes``.
+    Before this, ``user_tokens.scope`` was written once at OAuth-callback time and
+    never read or updated by anything, which is why a narrowed grant was
+    undetectable. ``COALESCE`` keeps any existing value when Microsoft omits the
+    field rather than blanking it.
     """
 
     expires_at = None
@@ -184,12 +263,13 @@ async def _persist_refreshed_token(
                 """
                 UPDATE user_tokens
                 SET access_token = $1, refresh_token = $2, expires_at = $3,
-                    updated_at = NOW()
-                WHERE user_id::text = $4
+                    scope = COALESCE($4, scope), updated_at = NOW()
+                WHERE user_id::text = $5
                 """,
                 access_token,
                 refresh_token,
                 expires_at,
+                scope,
                 user_id,
             )
         log.info("m365_token_refreshed", extra={"user_id": user_id})
@@ -246,9 +326,48 @@ async def _maybe_refresh_token(
             )
         response.raise_for_status()
         payload = response.json()
-    except (httpx.HTTPError, ValueError):
+    except httpx.HTTPStatusError as exc:
+        # A non-2xx from the token endpoint. The consent case is separated out
+        # because it is NOT transient: retrying cannot fix it, and the previous
+        # blanket handler downgraded it to a warning and reused the narrower
+        # token, which is why the scope mismatch stayed invisible.
+        body = exc.response.text or ""
+        if "AADSTS65001" in body or "invalid_grant" in body:
+            log.error(
+                "m365_token_scope_consent_required — the stored grant is narrower "
+                "than _REFRESH_SCOPE, so this refresh can never succeed. Clearing "
+                "the stored token to force re-consent via /authorize.",
+                extra={
+                    "user_id": user_id,
+                    "status_code": exc.response.status_code,
+                    "required_scope": _REFRESH_SCOPE,
+                },
+            )
+            await _clear_user_token(user_id)
+            return None
+        # Every other status is surfaced distinctly rather than swallowed into the
+        # same message, so a 429 or a 5xx is diagnosable as itself.
+        log.error(
+            "m365_token_refresh_http_error — refresh rejected; using existing token",
+            extra={
+                "user_id": user_id,
+                "status_code": exc.response.status_code,
+            },
+        )
+        return None
+    except httpx.HTTPError as exc:
+        # Transport-level failure (DNS, connect, timeout) — no response to read.
         log.warning(
-            "m365_token_refresh_failed — using existing token",
+            "m365_token_refresh_transport_error — using existing token",
+            extra={"user_id": user_id, "error": exc.__class__.__name__},
+        )
+        return None
+    except ValueError:
+        # 2xx whose body is not JSON. Kept separate from the HTTP branches: this
+        # is a malformed response, not a rejected request.
+        log.error(
+            "m365_token_refresh_malformed_response — token endpoint returned a "
+            "non-JSON body; using existing token",
             extra={"user_id": user_id},
         )
         return None
@@ -263,8 +382,24 @@ async def _maybe_refresh_token(
     # Microsoft may or may not rotate the refresh token; reuse the old one when
     # it does not return a fresh value.
     new_refresh = payload.get("refresh_token") or refresh_token
+    granted_scope = payload.get("scope")
+    # A 2xx that grants LESS than we asked for: Microsoft can issue a token for
+    # the subset it is willing to consent to rather than erroring. Without this
+    # check that downgrade is silent and the next Graph call 403s.
+    narrowed = _missing_scopes(granted_scope)
+    if narrowed:
+        log.error(
+            "m365_token_scope_narrowed — refresh succeeded but Microsoft granted "
+            "fewer scopes than requested; tools needing the missing scopes will "
+            "receive Graph 403 until the user re-consents.",
+            extra={
+                "user_id": user_id,
+                "missing_scopes": " ".join(narrowed),
+                "required_scope": _REFRESH_SCOPE,
+            },
+        )
     await _persist_refreshed_token(
-        user_id, new_access, new_refresh, payload.get("expires_in")
+        user_id, new_access, new_refresh, payload.get("expires_in"), granted_scope
     )
     return new_access
 
@@ -305,6 +440,23 @@ async def _get_m365_token(
 
     record = await _lookup_user_token_record(effective_user_id)
     if record is not None:
+        # READ the persisted grant. Until this existed, user_tokens.scope was
+        # written once and never read by anything, so a grant narrower than
+        # _REFRESH_SCOPE produced only an unexplained Graph 403. Logged per call
+        # rather than at startup because the grant is per user, not per process.
+        narrowed = _missing_scopes(record.get("scope"))
+        if narrowed:
+            log.error(
+                "m365_stored_grant_narrower_than_required — the stored consent does "
+                "not cover every scope this build needs; affected tools will receive "
+                "Graph 403 until the user re-consents via /authorize.",
+                extra={
+                    "user_id": effective_user_id,
+                    "missing_scopes": " ".join(narrowed),
+                    "required_scope": _REFRESH_SCOPE,
+                },
+            )
+
         refreshed = await _maybe_refresh_token(
             effective_user_id, record, force=force_refresh
         )
