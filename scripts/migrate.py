@@ -154,6 +154,20 @@ DDL_STATEMENTS = [
     """,
     "ALTER TABLE tenant_credentials ADD COLUMN IF NOT EXISTS credential_ciphertext BYTEA",
     "ALTER TABLE tenant_credentials ADD COLUMN IF NOT EXISTS key_version INT DEFAULT 1",
+    # Per-tenant tool guardrail configuration (agents.mcp.tenant_policy). Kept
+    # inline, like the blocks above, so this script needs no agents.* import;
+    # agents.mcp.portal_schema applies the same statement at server startup.
+    """
+    CREATE TABLE IF NOT EXISTS tenant_policies (
+        id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+        tenant_id UUID REFERENCES tenants(id) ON DELETE CASCADE,
+        policy_type TEXT NOT NULL,
+        policy JSONB NOT NULL DEFAULT '{}'::jsonb,
+        created_at TIMESTAMPTZ DEFAULT now(),
+        updated_at TIMESTAMPTZ DEFAULT now(),
+        UNIQUE(tenant_id, policy_type)
+    )
+    """,
 ]
 
 

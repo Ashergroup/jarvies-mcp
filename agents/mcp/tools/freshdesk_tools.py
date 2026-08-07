@@ -27,6 +27,8 @@ Four v2 API constraints shape this module, all confirmed in the current docs:
 
 Reads only. No ticket creation, no replies or notes, no status/priority/assignee
 changes — every tool here is ``write=False`` under the ``support_access`` scope.
+Those writes live in the companion ``freshdesk_write_tools``, which is where the
+per-tenant reply guardrail and the audit trail sit.
 """
 
 from __future__ import annotations
@@ -382,6 +384,26 @@ class FreshdeskService:
         return {
             "agents": agents,
             "count": len(agents),
+            "page": page,
+            "page_size": min(size, MAX_PER_PAGE),
+        }
+
+    # -- groups -------------------------------------------------------------
+
+    async def list_groups(
+        self, page: int = 1, page_size: int | None = None
+    ) -> dict[str, Any]:
+        """List agent groups — the id/name pairs the escalation policy needs."""
+
+        size = _resolve_page_size(page_size, self._settings)
+        payload = await self._get(
+            "groups",
+            params={"page": page, "per_page": min(size, MAX_PER_PAGE)},
+        )
+        groups = _coerce_list(payload, "groups")[:size]
+        return {
+            "groups": groups,
+            "count": len(groups),
             "page": page,
             "page_size": min(size, MAX_PER_PAGE),
         }
@@ -771,6 +793,47 @@ async def freshdesk_get_ticket_summary(
             await service.aclose()
 
 
+async def freshdesk_list_groups(
+    page: int = 1,
+    page_size: int | None = None,
+    tenant_id: str | None = None,
+    user_id: str | None = None,
+    access_token: str | None = None,
+    permissions: list[str] | None = None,
+) -> dict[str, Any]:
+    """Return Freshdesk agent groups, with their IDs.
+
+    The escalation policy addresses a group by ID, never by name — group names
+    differ per client and are renamed freely, so a name is not a stable
+    identifier. This tool is how an admin discovers the ID to put in
+    `escalation_group_id` via POST /admin/tenants/{tenant_id}/policy.
+
+    Args:
+        page, page_size: Pagination. page_size is capped at
+            MCP_TOOL_RESULT_LIMIT and at 100 by the API.
+
+    Returns:
+        IntegrationResult dict with `data.groups`, `data.count`, plus
+        pagination. Each group carries at least `id` and `name`.
+    """
+
+    context = _context(tenant_id, user_id, access_token, permissions)
+    with use_tenant_context(context):
+        check_permission(
+            context.tenant_id,
+            context.user_id,
+            "freshdesk_list_groups",
+            context.permissions,
+        )
+        service = await _service()
+        if service is None:
+            return _not_configured()
+        try:
+            return await _call(service.list_groups(page=page, page_size=page_size))
+        finally:
+            await service.aclose()
+
+
 def register(mcp: Any) -> None:
     """Register Freshdesk MCP tools (read-only)."""
 
@@ -779,3 +842,4 @@ def register(mcp: Any) -> None:
     mcp.tool()(freshdesk_search_tickets)
     mcp.tool()(freshdesk_list_agents)
     mcp.tool()(freshdesk_get_ticket_summary)
+    mcp.tool()(freshdesk_list_groups)

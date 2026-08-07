@@ -100,6 +100,17 @@ TOOL_POLICIES: dict[str, ToolPolicy] = {
     "freshdesk_search_tickets": ToolPolicy(required_any={"support_access"}),
     "freshdesk_list_agents": ToolPolicy(required_any={"support_access"}),
     "freshdesk_get_ticket_summary": ToolPolicy(required_any={"support_access"}),
+    "freshdesk_list_groups": ToolPolicy(required_any={"support_access"}),
+    # Freshdesk writes. Every one mutates a live ticket — a reply and a public
+    # note reach the customer — so all are write=True and refused to a
+    # read_only caller before the reply guardrail is ever consulted.
+    "freshdesk_reply_to_ticket": ToolPolicy(
+        required_any={"support_access"}, write=True
+    ),
+    "freshdesk_add_note": ToolPolicy(required_any={"support_access"}, write=True),
+    "freshdesk_update_ticket": ToolPolicy(required_any={"support_access"}, write=True),
+    "freshdesk_assign_ticket": ToolPolicy(required_any={"support_access"}, write=True),
+    "freshdesk_escalate": ToolPolicy(required_any={"support_access"}, write=True),
     "powerbi_list_reports": ToolPolicy(required_any={"finance_access"}),
     "powerbi_get_report": ToolPolicy(required_any={"finance_access"}),
     "powerbi_run_query": ToolPolicy(required_any={"finance_access"}),

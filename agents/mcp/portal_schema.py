@@ -18,6 +18,7 @@ from __future__ import annotations
 import logging
 
 from agents.mcp.database import get_conn
+from agents.mcp.tenant_policy import TENANT_POLICY_DDL
 
 log = logging.getLogger(__name__)
 
@@ -71,6 +72,10 @@ PORTAL_DDL_STATEMENTS = [
     """,
     "ALTER TABLE tenant_credentials ADD COLUMN IF NOT EXISTS credential_ciphertext BYTEA",
     "ALTER TABLE tenant_credentials ADD COLUMN IF NOT EXISTS key_version INT DEFAULT 1",
+    # Per-tenant tool guardrail configuration. Separate from tenant_credentials
+    # because it holds no secret and is returned in full by the admin API; see
+    # agents.mcp.tenant_policy for the resolution path.
+    TENANT_POLICY_DDL,
 ]
 
 

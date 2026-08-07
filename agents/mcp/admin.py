@@ -1,4 +1,4 @@
-"""Admin HTTP endpoints for tenant credential management.
+"""Admin HTTP endpoints for tenant credential and policy management.
 
 A small Starlette route family mounted at ``/admin`` so tenants can be
 onboarded without psql. These routes are protected by a dedicated
@@ -13,6 +13,12 @@ Storage: credentials live in ``tenant_credentials``, one row per
 the same layout the ClickUp tool and the seed migration use. Patch semantics:
 a POST updates only the fields supplied and merges them into any existing row,
 so fields that were not sent are never wiped.
+
+Guardrail policy lives alongside, under the same auth and the same patch-merge
+semantics, in ``tenant_policies`` (one row per ``(tenant_id, policy_type)``, the
+document in the ``policy`` JSONB — see ``agents.mcp.tenant_policy``). Policy
+values are returned in full where credentials return field names only: policy
+carries no secret, and an admin cannot fix a guardrail they cannot read.
 """
 
 from __future__ import annotations
@@ -26,9 +32,16 @@ from starlette.requests import Request
 from starlette.responses import JSONResponse
 from starlette.routing import Route
 
-from agents.mcp import credentials
+from agents.mcp import credentials, tenant_policy
 from agents.mcp.config import get_settings
 from agents.mcp.database import get_conn
+from agents.mcp.tenant_policy import (
+    NULLABLE_POLICY_FIELDS,
+    POLICY_FIELDS,
+    PolicyFieldError,
+    coerce_freshdesk_reply_policy,
+    validate_policy_field,
+)
 
 log = logging.getLogger(__name__)
 
@@ -145,6 +158,20 @@ async def _upsert_credentials(tenant_uuid: str, rows: dict[str, dict[str, Any]])
     """
 
     await credentials.upsert_tenant_credentials(tenant_uuid, rows)
+
+
+async def _fetch_policies(tenant_id: str) -> dict[str, dict[str, Any]]:
+    """Return {policy_type: <stored document>} for a tenant."""
+
+    return await tenant_policy.fetch_tenant_policies(tenant_id)
+
+
+async def _upsert_policy(
+    tenant_uuid: str, policy_type: str, policy: dict[str, Any]
+) -> None:
+    """Write one tenant_policies row (already merged by the caller)."""
+
+    await tenant_policy.upsert_tenant_policy(tenant_uuid, policy_type, policy)
 
 
 async def _list_tenants() -> list[dict[str, Any]]:
@@ -264,6 +291,130 @@ async def view_credentials(request: Request) -> JSONResponse:
         )
 
 
+async def set_policy(request: Request) -> JSONResponse:
+    """POST /admin/tenants/{tenant_id}/policy — patch-update guardrail policy.
+
+    Same auth and same patch-merge semantics as ``set_credentials``: only the
+    fields supplied are written, merged onto the tenant's existing document, so
+    unsent fields survive.
+
+    One deliberate difference. ``set_credentials`` reads a null as "not
+    supplied", because a null secret can only mean "leave it alone". Here null
+    is a legal value for a nullable field — it is how an admin clears
+    ``escalation_group_id`` — so a null on a nullable field is applied, and a
+    null on any other field is a 400 rather than a silent no-op.
+    """
+
+    if not _admin_authorized(request):
+        return _unauthorized()
+
+    tenant_id = request.path_params["tenant_id"]
+    try:
+        body = await request.json()
+    except (json.JSONDecodeError, ValueError, UnicodeDecodeError):
+        return JSONResponse(
+            {"status": "error", "error": "Invalid JSON body"}, status_code=400
+        )
+    if not isinstance(body, dict):
+        return JSONResponse(
+            {"status": "error", "error": "JSON body must be an object"}, status_code=400
+        )
+
+    # Validate before touching the database so a bad field changes nothing.
+    provided: list[str] = []
+    coerced: dict[str, Any] = {}
+    for field in POLICY_FIELDS:
+        if field not in body:
+            continue
+        value = body[field]
+        if value is None and field not in NULLABLE_POLICY_FIELDS:
+            return JSONResponse(
+                {"status": "error", "error": f"{field} may not be null"},
+                status_code=400,
+            )
+        try:
+            result = validate_policy_field(field, value)
+        except PolicyFieldError as exc:
+            return JSONResponse(
+                {"status": "error", "error": str(exc)}, status_code=400
+            )
+        coerced[field] = list(result) if isinstance(result, tuple) else result
+        provided.append(field)
+
+    try:
+        tenant = await _fetch_tenant(tenant_id)
+        if tenant is None:
+            return JSONResponse(
+                {"status": "error", "error": "Tenant not found"}, status_code=404
+            )
+
+        if provided:
+            existing = await _fetch_policies(tenant["id"])
+            to_write: dict[str, dict[str, Any]] = {}
+            for field in provided:
+                policy_type = POLICY_FIELDS[field]
+                document = to_write.get(policy_type)
+                if document is None:
+                    # Merge onto the stored document so unsent fields survive.
+                    document = dict(existing.get(policy_type) or {})
+                    to_write[policy_type] = document
+                document[field] = coerced[field]
+            for policy_type, document in to_write.items():
+                await _upsert_policy(tenant["id"], policy_type, document)
+
+        return JSONResponse(
+            {"status": "ok", "tenant_id": tenant["id"], "updated_fields": provided}
+        )
+    except Exception:
+        log.exception("admin_set_policy_failed", extra={"tenant_id": tenant_id})
+        return JSONResponse(
+            {"status": "error", "error": "Database error"}, status_code=500
+        )
+
+
+async def view_policy(request: Request) -> JSONResponse:
+    """GET /admin/tenants/{tenant_id}/policy — return the effective policy.
+
+    Unlike ``view_credentials``, which returns field names only, this returns
+    values: policy carries no secret, and an admin cannot correct a guardrail
+    they cannot read. ``policy`` is what the tools will actually apply —
+    stored values merged over the defaults — and ``configured`` lists the
+    fields the tenant has explicitly set, so defaults are distinguishable from
+    deliberate choices that happen to match them.
+    """
+
+    if not _admin_authorized(request):
+        return _unauthorized()
+
+    tenant_id = request.path_params["tenant_id"]
+    try:
+        tenant = await _fetch_tenant(tenant_id)
+        if tenant is None:
+            return JSONResponse(
+                {"status": "error", "error": "Tenant not found"}, status_code=404
+            )
+
+        policies = await _fetch_policies(tenant["id"])
+        stored = policies.get(tenant_policy.FRESHDESK_REPLY_POLICY) or {}
+        effective = coerce_freshdesk_reply_policy(stored).as_dict()
+        configured = [field for field in POLICY_FIELDS if field in stored]
+
+        return JSONResponse(
+            {
+                "status": "ok",
+                "tenant_id": tenant["id"],
+                "policy_type": tenant_policy.FRESHDESK_REPLY_POLICY,
+                "policy": effective,
+                "configured": configured,
+            }
+        )
+    except Exception:
+        log.exception("admin_view_policy_failed", extra={"tenant_id": tenant_id})
+        return JSONResponse(
+            {"status": "error", "error": "Database error"}, status_code=500
+        )
+
+
 async def list_tenants(request: Request) -> JSONResponse:
     """GET /admin/tenants — list all tenants (id, name, created_at)."""
 
@@ -297,6 +448,8 @@ def get_admin_routes() -> list[Route]:
             view_credentials,
             methods=["GET"],
         ),
+        Route("/admin/tenants/{tenant_id}/policy", set_policy, methods=["POST"]),
+        Route("/admin/tenants/{tenant_id}/policy", view_policy, methods=["GET"]),
     ]
 
 

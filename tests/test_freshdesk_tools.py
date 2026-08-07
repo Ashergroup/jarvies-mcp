@@ -21,6 +21,7 @@ FRESHDESK_TOOLS = (
     "freshdesk_search_tickets",
     "freshdesk_list_agents",
     "freshdesk_get_ticket_summary",
+    "freshdesk_list_groups",
 )
 
 
