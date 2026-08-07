@@ -191,12 +191,29 @@ Deliberately NOT exposed: `delete_task`, `delete_comment`, `delete_subtask`, bul
 
 ClickUp uses a flat `Authorization: <token>` header (not `Bearer <token>`) — a documented v2 quirk.
 
-**Freshsales** (`freshsales_tools.py`):
+**Freshsales** (`freshsales_tools.py`) — CRM:
 
 - `freshsales_get_contacts`
 - `freshsales_get_accounts`
 - `freshsales_get_deals`
 - `freshsales_search`
+
+**Freshdesk** (`freshdesk_tools.py`) — helpdesk, a separate product from
+Freshsales with its own API and credentials. Read-only, `support_access` scope:
+
+- `freshdesk_list_tickets`
+- `freshdesk_get_ticket`
+- `freshdesk_search_tickets`
+- `freshdesk_list_agents`
+- `freshdesk_get_ticket_summary`
+
+Deliberately NOT exposed: ticket creation, replies and notes, status/priority
+changes, assignment, merge, or delete.
+
+Two v2 API limits leak into the tool contracts: status/priority/agent filtering
+only exists on `GET /search/tickets` (30 results per page, 10 pages max), and
+there is no public full-text search, so `freshdesk_search_tickets` scans ticket
+pages and matches subject/description locally, reporting its own scan bounds.
 
 **Power BI** (`powerbi_tools.py`):
 
@@ -222,13 +239,20 @@ Every real tool checks:
 check_permission(tenant_id, user_id, tool_name, permissions)
 ```
 
-Supported permissions:
+Domain scopes:
 
-- `read_only`
 - `m365_access`
 - `finance_access`
+- `freshsales_access`
 - `fundraising_access`
-- `admin_access`
+- `db_access` — the PostgreSQL tools (`db_read_query`, `db_select`)
+- `support_access` — the Freshdesk tools
+
+Modifiers:
+
+- `read_only` — the write ceiling. Not a domain scope: it grants nothing on its
+  own, and a caller holding it is denied every write tool.
+- `admin_access` — bypasses every check, including the `read_only` ceiling.
 
 Write tools are denied when the caller has `read_only` unless they also have `admin_access`.
 
@@ -246,7 +270,7 @@ For local smoke tests, defaults can be set with:
 ```text
 MCP_DEFAULT_TENANT_ID=local
 MCP_DEFAULT_USER_ID=local-user
-MCP_DEFAULT_PERMISSIONS=m365_access,read_only
+MCP_DEFAULT_PERMISSIONS=m365_access,finance_access,freshsales_access,fundraising_access,db_access,support_access
 ```
 
 For production, pass tenant and user context explicitly from the MCP client or identity gateway.

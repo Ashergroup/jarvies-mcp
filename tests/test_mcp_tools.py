@@ -43,6 +43,45 @@ def test_permission_denies_readonly_write() -> None:
         )
 
 
+@pytest.mark.parametrize("tool", ["db_read_query", "db_select"])
+def test_db_access_permits_database_tools(tool: str) -> None:
+    assert check_permission("tenant-a", "user-a", tool, ["db_access"])
+
+
+@pytest.mark.parametrize("tool", ["db_read_query", "db_select"])
+def test_read_only_alone_no_longer_permits_database_tools(tool: str) -> None:
+    # read_only is a write ceiling, not a domain scope: it grants nothing.
+    with pytest.raises(MCPPermissionError, match="requires one of: db_access"):
+        check_permission("tenant-a", "user-a", tool, ["read_only"])
+
+
+def test_read_only_with_db_access_still_permits_reads() -> None:
+    assert check_permission(
+        "tenant-a", "user-a", "db_read_query", ["db_access", "read_only"]
+    )
+
+
+@pytest.mark.parametrize(
+    ("tool", "scope"),
+    [
+        ("m365_send_email", "m365_access"),
+        ("xero_create_invoice", "finance_access"),
+        ("freshsales_create_contact", "fundraising_access"),
+    ],
+)
+def test_read_only_still_blocks_writes_alongside_domain_scope(
+    tool: str, scope: str
+) -> None:
+    with pytest.raises(MCPPermissionError, match="caller is read_only"):
+        check_permission("tenant-a", "user-a", tool, [scope, "read_only"])
+
+
+def test_admin_access_overrides_read_only_write_ceiling() -> None:
+    assert check_permission(
+        "tenant-a", "user-a", "m365_send_email", ["read_only", "admin_access"]
+    )
+
+
 def test_database_validation_rejects_dangerous_sql() -> None:
     with pytest.raises(db_tools.UnsafeQueryError):
         db_tools._validate_readonly_query("DROP TABLE users")

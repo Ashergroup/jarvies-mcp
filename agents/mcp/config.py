@@ -157,6 +157,12 @@ class MCPSettings(BaseSettings):
     freshsales_domain: str = Field(default="", validation_alias="FRESHSALES_DOMAIN")
     freshsales_api_key: str = Field(default="", validation_alias="FRESHSALES_API_KEY")
 
+    # Freshdesk (helpdesk) — a different product from Freshsales (CRM) above,
+    # with its own API, host, and key. Accepts either the bare subdomain
+    # ("acme") or the full host ("acme.freshdesk.com").
+    freshdesk_domain: str = Field(default="", validation_alias="FRESHDESK_DOMAIN")
+    freshdesk_api_key: str = Field(default="", validation_alias="FRESHDESK_API_KEY")
+
     clickup_api_token: str = Field(default="", validation_alias="CLICKUP_API_TOKEN")
     clickup_team_id: str = Field(default="", validation_alias="CLICKUP_TEAM_ID")
     clickup_ir_list_id: str = Field(
@@ -286,6 +292,12 @@ class MCPSettings(BaseSettings):
         """Return True when Freshsales API credentials are present."""
 
         return bool(self.freshsales_domain and self.freshsales_api_key)
+
+    @property
+    def freshdesk_configured(self) -> bool:
+        """Return True when Freshdesk API credentials are present."""
+
+        return bool(self.freshdesk_domain and self.freshdesk_api_key)
 
     @property
     def clickup_fields_config_path(self) -> Path:

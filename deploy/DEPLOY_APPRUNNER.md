@@ -81,13 +81,17 @@ source build.
 
 `ENVIRONMENT=production`, `PORT=8080`, `MCP_LOG_LEVEL=INFO`,
 `MCP_ALLOW_UNAUTHENTICATED=false`, `MCP_DEFAULT_TENANT_ID`,
-`MCP_DEFAULT_USER_ID`, `MCP_DEFAULT_PERMISSIONS=read_only`,
-`CLICKUP_CUSTOM_FIELDS_CONFIG_PATH`, `MCP_DB_READONLY=true`.
+`MCP_DEFAULT_USER_ID`, `MCP_DEFAULT_PERMISSIONS` (the domain scopes the deploy
+needs), `CLICKUP_CUSTOM_FIELDS_CONFIG_PATH`, `MCP_DB_READONLY=true`.
 
-> `MCP_DEFAULT_PERMISSIONS` is `read_only` on purpose. **Do not** add
-> `admin_access` to the default set in production — callers should pass explicit
-> permissions per request. The server logs an ERROR at startup if it sees
-> `admin_access` in the default set in production.
+> `MCP_DEFAULT_PERMISSIONS` lists domain scopes:
+> `m365_access,finance_access,freshsales_access,fundraising_access,db_access,support_access`.
+> `read_only` is **not** a scope — it is the write ceiling, so it grants nothing
+> on its own and refuses every write tool when present. Include it only for a
+> deploy that is meant to be read-only. **Do not** add `admin_access` to the
+> default set in production — callers should pass explicit permissions per
+> request. The server logs an ERROR at startup if it sees `admin_access` in the
+> default set in production.
 
 ### Required per integration you actually use
 

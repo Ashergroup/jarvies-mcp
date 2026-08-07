@@ -34,13 +34,15 @@ run:
     - name: MCP_ALLOW_UNAUTHENTICATED
       value: "false"
     # Default tool context. Do NOT include admin_access here — callers should
-    # pass explicit permissions per request. read_only is a safe default floor.
+    # pass explicit permissions per request. List the domain scopes the deploy
+    # actually needs: read_only on its own grants nothing (it is the write
+    # ceiling, not a scope), and adding it here would refuse every write tool.
     - name: MCP_DEFAULT_TENANT_ID
       value: "production"
     - name: MCP_DEFAULT_USER_ID
       value: "service"
     - name: MCP_DEFAULT_PERMISSIONS
-      value: "read_only"
+      value: "m365_access,finance_access,freshsales_access,fundraising_access,db_access,support_access"
     # ClickUp field map is committed to the repo; this path is inside the
     # container working directory (/app) after the source build.
     - name: CLICKUP_CUSTOM_FIELDS_CONFIG_PATH
@@ -85,6 +87,10 @@ run:
     # - name: CIN7_ACCOUNT_ID
     # - name: CIN7_API_KEY
     #
-    # Freshsales — set if the Freshsales integration is in use:
+    # Freshsales (CRM) — set if the Freshsales integration is in use:
     # - name: FRESHSALES_DOMAIN
     # - name: FRESHSALES_API_KEY
+    #
+    # Freshdesk (helpdesk, separate product and key from Freshsales):
+    # - name: FRESHDESK_DOMAIN
+    # - name: FRESHDESK_API_KEY

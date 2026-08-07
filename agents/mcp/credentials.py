@@ -1,6 +1,6 @@
 """Shared per-tenant credential resolver for the DB-backed integrations.
 
-Xero, Cin7, and Freshsales resolve their credentials here: the tenant's row in
+Xero, Cin7, Freshsales, and Freshdesk resolve their credentials here: the tenant's row in
 ``tenant_credentials`` when present, otherwise the process environment variables
 (so the existing single-tenant Asher Group config keeps working until migrated).
 
@@ -45,6 +45,7 @@ _CREDENTIAL_MAP: dict[str, tuple[str, dict[str, str]]] = {
     ),
     "cin7": ("cin7_api_key", {"account_id": "cin7_account_id"}),
     "freshsales": ("freshsales_api_key", {"domain": "freshsales_domain"}),
+    "freshdesk": ("freshdesk_api_key", {"domain": "freshdesk_domain"}),
 }
 
 

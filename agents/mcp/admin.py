@@ -48,6 +48,8 @@ _FIELD_MAP: dict[str, tuple[str, str | None]] = {
     "cin7_account_id": ("cin7", "account_id"),
     "freshsales_api_key": ("freshsales", None),
     "freshsales_domain": ("freshsales", "domain"),
+    "freshdesk_api_key": ("freshdesk", None),
+    "freshdesk_domain": ("freshdesk", "domain"),
 }
 _KNOWN_FIELDS = list(_FIELD_MAP.keys())
 

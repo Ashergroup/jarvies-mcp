@@ -1,8 +1,8 @@
 """Shared response envelope for third-party integration MCP tools.
 
 Adopted from finpilot-agent (`agents/finpilot/models.py`). Used only by the
-new read-only integration tool families: `xero_*`, `cin7_*`, `freshsales_*`.
-M365 and DB tools keep their existing return shapes.
+new read-only integration tool families: `xero_*`, `cin7_*`, `freshsales_*`,
+`freshdesk_*`. M365 and DB tools keep their existing return shapes.
 """
 
 from __future__ import annotations
@@ -11,12 +11,12 @@ from typing import Any, Literal
 
 from pydantic import BaseModel, Field
 
-IntegrationSource = Literal["xero", "cin7", "freshsales"]
+IntegrationSource = Literal["xero", "cin7", "freshsales", "freshdesk"]
 IntegrationStatus = Literal["ok", "not_configured", "error", "skipped"]
 
 
 class IntegrationResult(BaseModel):
-    """Normalized integration response returned by Xero/Cin7/Freshsales tools."""
+    """Normalized response returned by Xero/Cin7/Freshsales/Freshdesk tools."""
 
     source: IntegrationSource
     status: IntegrationStatus

@@ -2,6 +2,13 @@
 
 The MCP layer is intentionally closed by default. A client must supply the
 domain-specific permission needed by the tool, or `admin_access`.
+
+Domain scopes: `m365_access`, `finance_access`, `freshsales_access`,
+`fundraising_access`, `db_access`, `support_access`.
+
+`read_only` is NOT a domain scope. It is a write ceiling: a caller that passes
+it is refused every `write=True` tool (unless it also holds `admin_access`), and
+it grants nothing on its own.
 """
 
 from __future__ import annotations
@@ -86,13 +93,25 @@ TOOL_POLICIES: dict[str, ToolPolicy] = {
     "freshsales_get_deal_stages": ToolPolicy(required_any={"fundraising_access"}),
     "freshsales_get_contact_journey": ToolPolicy(required_any={"fundraising_access"}),
     "freshsales_search_contacts": ToolPolicy(required_any={"fundraising_access"}),
+    # Freshdesk (helpdesk) — read-only family under its own support_access scope,
+    # kept separate from the Freshsales (CRM) scopes above.
+    "freshdesk_list_tickets": ToolPolicy(required_any={"support_access"}),
+    "freshdesk_get_ticket": ToolPolicy(required_any={"support_access"}),
+    "freshdesk_search_tickets": ToolPolicy(required_any={"support_access"}),
+    "freshdesk_list_agents": ToolPolicy(required_any={"support_access"}),
+    "freshdesk_get_ticket_summary": ToolPolicy(required_any={"support_access"}),
     "powerbi_list_reports": ToolPolicy(required_any={"finance_access"}),
     "powerbi_get_report": ToolPolicy(required_any={"finance_access"}),
     "powerbi_run_query": ToolPolicy(required_any={"finance_access"}),
     "finance_list_systems": ToolPolicy(required_any={"finance_access"}),
     "finance_get_integration_status": ToolPolicy(required_any={"finance_access"}),
-    "db_read_query": ToolPolicy(required_any={"read_only"}),
-    "db_select": ToolPolicy(required_any={"read_only"}),
+    # `db_access` is the domain scope for the PostgreSQL tools. It replaced
+    # `read_only`, which is not a domain scope at all but the write ceiling
+    # applied below — granting it was never meant to be the way to reach the DB
+    # tools, and it stopped working the moment `read_only` left
+    # MCP_DEFAULT_PERMISSIONS to unblock the write tools.
+    "db_read_query": ToolPolicy(required_any={"db_access"}),
+    "db_select": ToolPolicy(required_any={"db_access"}),
     "clickup_list_tasks": ToolPolicy(required_any={"fundraising_access"}),
     "clickup_get_task": ToolPolicy(required_any={"fundraising_access"}),
     "clickup_get_tasks_needing_work": ToolPolicy(
@@ -171,8 +190,10 @@ def check_permission(
         tenant_id: Client tenant identifier.
         user_id: User or service principal identifier.
         tool_name: MCP tool name.
-        permissions: Caller permissions such as `m365_access`, `read_only`,
-            `finance_access`, or `admin_access`.
+        permissions: Caller permissions — one or more domain scopes such as
+            `m365_access`, `finance_access`, or `db_access`; optionally
+            `read_only` to cap the call at reads; or `admin_access`, which
+            bypasses every check.
 
     Returns:
         True when the call is allowed.
