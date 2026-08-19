@@ -260,7 +260,12 @@ class FreshdeskWriteService(FreshdeskService):
         cc_emails: list[str] | None = None,
         bcc_emails: list[str] | None = None,
     ) -> dict[str, Any]:
-        """POST a public reply. Freshdesk renders ``body`` as HTML and sends it."""
+        """POST a public reply.
+
+        Freshdesk renders the field as HTML — pass raw HTML tags if you want
+        formatting (never entity-escaped like ``&lt;p&gt;``), or plain text
+        with line breaks. Not markdown.
+        """
 
         payload: dict[str, Any] = {"body": body}
         if cc_emails:
@@ -651,7 +656,9 @@ async def freshdesk_reply_to_ticket(
 
     Args:
         ticket_id: One Freshdesk ticket ID. Lists are refused.
-        body: Reply body. Freshdesk renders it as HTML.
+        body: Reply body. Freshdesk renders the field as HTML — pass raw
+            HTML tags if you want formatting (never entity-escaped like
+            &lt;p&gt;), or plain text with line breaks. Not markdown.
         reason: Why this reply is being sent. Recorded in the audit log; not
             sent to Freshdesk. Required.
         cc_emails: Additional recipients copied on the reply.
@@ -739,7 +746,9 @@ async def freshdesk_add_note(
 
     Args:
         ticket_id: One Freshdesk ticket ID. Lists are refused.
-        body: Note body, rendered as HTML.
+        body: Note body. Freshdesk renders the field as HTML — pass raw
+            HTML tags if you want formatting (never entity-escaped like
+            &lt;p&gt;), or plain text with line breaks. Not markdown.
         reason: Why this note is being added. Recorded in the audit log;
             not sent to Freshdesk. Required.
         private: Keep the note internal. Defaults to true.
