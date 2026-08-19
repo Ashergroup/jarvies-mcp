@@ -22,6 +22,7 @@ FRESHDESK_TOOLS = (
     "freshdesk_list_agents",
     "freshdesk_get_ticket_summary",
     "freshdesk_list_groups",
+    "freshdesk_get_contact",
 )
 
 
@@ -524,6 +525,63 @@ async def test_ticket_summary_falls_back_to_counting_results(
         )
 
     assert result["data"]["by_status"]["open"] == 1
+
+
+# ---------------------------------------------------------------------------
+# freshdesk_get_contact
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_get_contact_returns_the_record_verbatim(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _set_freshdesk_env(monkeypatch)
+
+    record = {
+        "id": 68003385267,
+        "name": "Nomsa Dlamini",
+        "email": None,
+        "phone": None,
+        "mobile": "+27821234567",
+        "twitter_id": None,
+        "unique_external_id": "wa:27821234567",
+        "company_id": 4200,
+        "custom_fields": {"cf_account_ref": "NG-1183"},
+    }
+
+    with respx.mock(assert_all_called=True) as mock:
+        route = mock.get(f"{BASE}/contacts/68003385267").mock(
+            return_value=httpx.Response(200, json=record)
+        )
+        result = await freshdesk_tools.freshdesk_get_contact(
+            contact_id=68003385267, permissions=["support_access"]
+        )
+
+    assert result["status"] == "ok"
+    # Verbatim: nothing projected away, custom_fields included.
+    assert result["data"]["contact"] == record
+    assert result["data"]["contact_id"] == 68003385267
+    assert route.calls[0].request.headers["Authorization"] == EXPECTED_AUTH
+
+
+@pytest.mark.asyncio
+async def test_get_contact_reports_a_missing_contact_as_an_error(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _set_freshdesk_env(monkeypatch)
+
+    with respx.mock(assert_all_called=True) as mock:
+        mock.get(f"{BASE}/contacts/999").mock(
+            return_value=httpx.Response(404, json={"description": "Not found"})
+        )
+        result = await freshdesk_tools.freshdesk_get_contact(
+            contact_id=999, permissions=["support_access"]
+        )
+
+    assert result["status"] == "error"
+    assert "404" in (result["error"] or "")
+    assert result["data"] is None or "contact" not in (result["data"] or {})
 
 
 # ---------------------------------------------------------------------------

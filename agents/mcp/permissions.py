@@ -101,6 +101,7 @@ TOOL_POLICIES: dict[str, ToolPolicy] = {
     "freshdesk_list_agents": ToolPolicy(required_any={"support_access"}),
     "freshdesk_get_ticket_summary": ToolPolicy(required_any={"support_access"}),
     "freshdesk_list_groups": ToolPolicy(required_any={"support_access"}),
+    "freshdesk_get_contact": ToolPolicy(required_any={"support_access"}),
     # Freshdesk writes. Every one mutates a live ticket — a reply and a public
     # note reach the customer — so all are write=True and refused to a
     # read_only caller before the reply guardrail is ever consulted.

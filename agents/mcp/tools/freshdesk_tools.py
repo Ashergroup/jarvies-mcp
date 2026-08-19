@@ -408,6 +408,20 @@ class FreshdeskService:
             "page_size": min(size, MAX_PER_PAGE),
         }
 
+    # -- contacts -----------------------------------------------------------
+
+    async def get_contact(self, contact_id: str | int) -> dict[str, Any]:
+        """Return one contact record — the requester behind a ticket.
+
+        A ticket's ``requester_id`` is a contact ID, so this is how a ticket
+        resolves to a name, an email, and a phone number. WhatsApp-origin
+        tickets carry no email on the ticket itself; the contact record is the
+        only place the phone number lives.
+        """
+
+        contact = await self._get(f"contacts/{contact_id}")
+        return {"contact": contact, "contact_id": contact_id}
+
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -834,6 +848,50 @@ async def freshdesk_list_groups(
             await service.aclose()
 
 
+async def freshdesk_get_contact(
+    contact_id: str | int,
+    tenant_id: str | None = None,
+    user_id: str | None = None,
+    access_token: str | None = None,
+    permissions: list[str] | None = None,
+) -> dict[str, Any]:
+    """Return one Freshdesk contact by ID.
+
+    Resolves a ticket's `requester_id` into the person behind it. A WhatsApp
+    ticket arrives with a phone number and no email, so the contact record is
+    what makes it matchable against another system.
+
+    The record is returned as Freshdesk sends it, `custom_fields` included —
+    it is customer personal data, so treat it as confidential and quote from
+    it only where the task needs it.
+
+    Args:
+        contact_id: Freshdesk contact ID. A ticket's `requester_id` is one.
+
+    Returns:
+        IntegrationResult dict with `data.contact` — the record verbatim,
+        carrying at least `id`, `name`, `email`, `phone`, and `mobile` — and
+        `data.contact_id`. A contact that does not exist, or was deleted,
+        comes back as an HTTP 404 error rather than an empty record.
+    """
+
+    context = _context(tenant_id, user_id, access_token, permissions)
+    with use_tenant_context(context):
+        check_permission(
+            context.tenant_id,
+            context.user_id,
+            "freshdesk_get_contact",
+            context.permissions,
+        )
+        service = await _service()
+        if service is None:
+            return _not_configured()
+        try:
+            return await _call(service.get_contact(contact_id=contact_id))
+        finally:
+            await service.aclose()
+
+
 def register(mcp: Any) -> None:
     """Register Freshdesk MCP tools (read-only)."""
 
@@ -843,3 +901,4 @@ def register(mcp: Any) -> None:
     mcp.tool()(freshdesk_list_agents)
     mcp.tool()(freshdesk_get_ticket_summary)
     mcp.tool()(freshdesk_list_groups)
+    mcp.tool()(freshdesk_get_contact)
