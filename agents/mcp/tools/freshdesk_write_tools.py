@@ -1,13 +1,22 @@
 """Freshdesk MCP write tools — guardrailed, audited ticket mutations.
 
-Companion to ``freshdesk_tools.py`` (read-only). Five tools mutate one live
-ticket: ``freshdesk_reply_to_ticket``, ``freshdesk_add_note``,
-``freshdesk_update_ticket``, ``freshdesk_assign_ticket``, ``freshdesk_escalate``.
-A sixth, ``freshdesk_validate_reply_body``, writes nothing: it exposes the
+Companion to ``freshdesk_tools.py`` (read-only). Six tools mutate one live
+ticket: ``freshdesk_reply_to_ticket``, ``stage_ai_reply``,
+``freshdesk_add_note``, ``freshdesk_update_ticket``,
+``freshdesk_assign_ticket``, ``freshdesk_escalate``. ``stage_ai_reply`` is the
+odd one: it writes only the three WhatsApp Automation custom fields on the
+ticket and never creates a conversation, so nothing it does reaches the
+customer by itself -- a Freshdesk automation rule reads those fields and does
+the sending.
+
+A seventh, ``freshdesk_validate_reply_body``, writes nothing: it exposes the
 reply guardrail's verdict on its own, so a caller whose send does NOT come
 back through this server can still be held to the tenant's policy. It lives
 here rather than in the read module because it reuses this module's guardrail
-directly -- one implementation, not a copy.
+directly -- one implementation, not a copy. ``stage_ai_reply`` is exactly the
+path it was built for: the text it stages is delivered by Freshdesk, not by
+this server, so the caller must validate before staging.
+
 Auth, base URL, credential resolution, and the response envelope are reused from
 the read module unchanged.
 
@@ -816,6 +825,92 @@ async def freshdesk_reply_to_ticket(
             await service.aclose()
 
 
+async def stage_ai_reply(
+    ticket_id: str | int,
+    reply_body: str,
+    tenant_id: str | None = None,
+    user_id: str | None = None,
+    access_token: str | None = None,
+    permissions: list[str] | None = None,
+) -> dict[str, Any]:
+    """Stage one AI reply for a Freshdesk WhatsApp automation.
+
+    This tool deliberately does not create a conversation or send a reply.
+    It writes only the three agreed ticket custom fields.  Repeating the same
+    body while it is already staged or sent is an idempotent no-op.
+    """
+
+    context = _context(tenant_id, user_id, access_token, permissions)
+    with use_tenant_context(context):
+        check_permission(context.tenant_id, context.user_id, "stage_ai_reply", context.permissions)
+        try:
+            ticket = _single_ticket_id(ticket_id)
+            body = str(reply_body or "").strip()
+            if not body:
+                raise ValueError("reply_body cannot be empty")
+            if len(body) > 4096:
+                raise ValueError("reply_body exceeds the 4096 character limit")
+        except ValueError as exc:
+            return _error(str(exc))
+
+        service = await _write_service()
+        if service is None:
+            return not_configured("freshdesk", _NOT_CONFIGURED)
+        try:
+            try:
+                current = await service._get(f"tickets/{ticket}")
+            except (httpx.HTTPError, ValueError, FreshdeskAPIError) as exc:
+                return _error(f"could not read ticket before staging: {exc}")
+
+            custom = current.get("custom_fields") if isinstance(current, dict) else None
+            custom = custom if isinstance(custom, dict) else {}
+            source = current.get("source") if isinstance(current, dict) else None
+            source_name = str(current.get("channel") or "").casefold() if isinstance(current, dict) else ""
+            if source != 13 and source_name != "whatsapp":
+                return _error(
+                    f"ticket {ticket} is not a WhatsApp ticket; staging refused",
+                    {"ticket_id": ticket, "source": source, "channel": source_name},
+                )
+            current_body = str(custom.get("cf_cf_ai_reply_body") or "")
+            current_status = str(custom.get("cf_cf_ai_reply_status") or "").lower()
+            if current_body == body and current_status in {"staged", "sent", "delivered"}:
+                return await _invoke(
+                    _already_staged(ticket, current_status),
+                    action="stage_ai_reply",
+                    ticket_id=ticket,
+                    reason="idempotent duplicate stage",
+                    tenant_id=_audit_tenant_id(context.tenant_id),
+                    actor_id=context.user_id,
+                    audit_metadata={"status": current_status, "idempotent": True},
+                )
+
+            data = await _invoke(
+                service.update_ticket(
+                    ticket_id=ticket,
+                    fields={
+                        "custom_fields": {
+                            "cf_cf_ai_reply_body": body,
+                            "cf_cf_ai_reply_ready": True,
+                            "cf_cf_ai_reply_status": "staged",
+                        }
+                    },
+                ),
+                action="stage_ai_reply",
+                ticket_id=ticket,
+                reason="stage AI WhatsApp reply",
+                tenant_id=_audit_tenant_id(context.tenant_id),
+                actor_id=context.user_id,
+                audit_metadata={"status": "staged", "body_chars": len(body)},
+            )
+            return data
+        finally:
+            await service.aclose()
+
+
+async def _already_staged(ticket_id: str | int, status: str) -> dict[str, Any]:
+    return {"ticket_id": ticket_id, "status": status, "staged": True, "idempotent": True}
+
+
 async def freshdesk_add_note(
     ticket_id: str | int,
     body: str,
@@ -1223,6 +1318,7 @@ def register(mcp: Any) -> None:
 
     mcp.tool()(freshdesk_validate_reply_body)
     mcp.tool()(freshdesk_reply_to_ticket)
+    mcp.tool()(stage_ai_reply)
     mcp.tool()(freshdesk_add_note)
     mcp.tool()(freshdesk_update_ticket)
     mcp.tool()(freshdesk_assign_ticket)

@@ -822,6 +822,89 @@ async def test_update_ticket_with_no_fields_is_refused(
 
 
 @pytest.mark.asyncio
+async def test_stage_ai_reply_writes_only_whatsapp_fields(
+    as_tenant, audit_rows
+) -> None:
+    as_tenant()
+    with respx.mock:
+        respx.get(TICKET_URL).mock(
+            return_value=httpx.Response(
+                200, json={"id": TICKET_ID, "source": 13, "custom_fields": {}}
+            )
+        )
+        route = respx.put(TICKET_URL).mock(
+            return_value=httpx.Response(200, json={"id": TICKET_ID})
+        )
+        result = await freshdesk_write_tools.stage_ai_reply(
+            ticket_id=TICKET_ID,
+            reply_body="We have checked this for you.",
+            permissions=["support_access"],
+        )
+
+    assert result["status"] == "ok"
+    payload = json.loads(route.calls[0].request.content)
+    assert payload == {
+        "custom_fields": {
+            "cf_ai_reply_body": "We have checked this for you.",
+            "cf_ai_reply_ready": True,
+            "cf_ai_reply_status": "staged",
+        }
+    }
+    assert audit_rows[0]["action"] == "stage_ai_reply"
+
+
+@pytest.mark.asyncio
+async def test_stage_ai_reply_duplicate_is_idempotent(as_tenant, audit_rows) -> None:
+    as_tenant()
+    body = "Already staged."
+    with respx.mock:
+        respx.get(TICKET_URL).mock(
+            return_value=httpx.Response(
+                200,
+                json={
+                    "id": TICKET_ID,
+                    "source": 13,
+                    "custom_fields": {
+                        "cf_ai_reply_body": body,
+                        "cf_ai_reply_status": "staged",
+                    },
+                },
+            )
+        )
+        route = respx.put(TICKET_URL)
+        result = await freshdesk_write_tools.stage_ai_reply(
+            ticket_id=TICKET_ID,
+            reply_body=body,
+            permissions=["support_access"],
+        )
+
+    assert result["status"] == "ok"
+    assert result["data"]["idempotent"] is True
+    assert route.call_count == 0
+
+
+@pytest.mark.asyncio
+async def test_stage_ai_reply_refuses_non_whatsapp_ticket(as_tenant) -> None:
+    as_tenant()
+    with respx.mock:
+        respx.get(TICKET_URL).mock(
+            return_value=httpx.Response(
+                200, json={"id": TICKET_ID, "source": 1, "custom_fields": {}}
+            )
+        )
+        route = respx.put(TICKET_URL)
+        result = await freshdesk_write_tools.stage_ai_reply(
+            ticket_id=TICKET_ID,
+            reply_body="This must not be staged.",
+            permissions=["support_access"],
+        )
+
+    assert result["status"] == "error"
+    assert "not a WhatsApp ticket" in result["error"]
+    assert route.call_count == 0
+
+
+@pytest.mark.asyncio
 async def test_assign_requires_a_target(as_tenant, stored_policy) -> None:
     as_tenant()
     stored_policy(None)
