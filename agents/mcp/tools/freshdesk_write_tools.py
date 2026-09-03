@@ -865,7 +865,11 @@ async def stage_ai_reply(
             custom = current.get("custom_fields") if isinstance(current, dict) else None
             custom = custom if isinstance(custom, dict) else {}
             source = current.get("source") if isinstance(current, dict) else None
-            source_name = str(current.get("channel") or "").casefold() if isinstance(current, dict) else ""
+            source_name = (
+                str(current.get("channel") or "").casefold()
+                if isinstance(current, dict)
+                else ""
+            )
             if source != 13 and source_name != "whatsapp":
                 return _error(
                     f"ticket {ticket} is not a WhatsApp ticket; staging refused",

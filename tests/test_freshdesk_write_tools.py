@@ -33,8 +33,33 @@ REPLY_URL = f"{BASE}/tickets/{TICKET_ID}/reply"
 NOTES_URL = f"{BASE}/tickets/{TICKET_ID}/notes"
 TICKET_URL = f"{BASE}/tickets/{TICKET_ID}"
 
+# The tools that satisfy the full write-tool contract: write=True, a required
+# non-empty ``reason``, and one ticket per call. This tuple parametrises the
+# contract tests below, so a tool only belongs here if it honours all three.
 WRITE_TOOLS = (
     "freshdesk_reply_to_ticket",
+    "freshdesk_add_note",
+    "freshdesk_update_ticket",
+    "freshdesk_assign_ticket",
+    "freshdesk_escalate",
+)
+
+# Everything ``register`` advertises, in registration order. Wider than
+# WRITE_TOOLS by the two tools that take no ``reason``, and each sits outside
+# the contract above for its own reason:
+#
+#   freshdesk_validate_reply_body  writes nothing, so it is write=False on
+#       purpose -- a read_only caller is allowed to ask whether text would pass.
+#   stage_ai_reply                 writes only the WhatsApp Automation custom
+#       fields and creates no conversation, so there is no send to justify.
+#
+# Kept separate rather than widening WRITE_TOOLS: putting either one there
+# would assert write=True of a read-only tool and would call both with a
+# ``reason`` kwarg neither accepts.
+REGISTERED_TOOLS = (
+    "freshdesk_validate_reply_body",
+    "freshdesk_reply_to_ticket",
+    "stage_ai_reply",
     "freshdesk_add_note",
     "freshdesk_update_ticket",
     "freshdesk_assign_ticket",
@@ -154,7 +179,7 @@ def test_all_write_tools_are_registered() -> None:
             return decorate
 
     freshdesk_write_tools.register(_Recorder())
-    assert registered == list(WRITE_TOOLS)
+    assert registered == list(REGISTERED_TOOLS)
 
 
 def test_module_carries_no_client_specific_values() -> None:
@@ -845,9 +870,9 @@ async def test_stage_ai_reply_writes_only_whatsapp_fields(
     payload = json.loads(route.calls[0].request.content)
     assert payload == {
         "custom_fields": {
-            "cf_ai_reply_body": "We have checked this for you.",
-            "cf_ai_reply_ready": True,
-            "cf_ai_reply_status": "staged",
+            "cf_cf_ai_reply_body": "We have checked this for you.",
+            "cf_cf_ai_reply_ready": True,
+            "cf_cf_ai_reply_status": "staged",
         }
     }
     assert audit_rows[0]["action"] == "stage_ai_reply"
@@ -865,8 +890,8 @@ async def test_stage_ai_reply_duplicate_is_idempotent(as_tenant, audit_rows) -> 
                     "id": TICKET_ID,
                     "source": 13,
                     "custom_fields": {
-                        "cf_ai_reply_body": body,
-                        "cf_ai_reply_status": "staged",
+                        "cf_cf_ai_reply_body": body,
+                        "cf_cf_ai_reply_status": "staged",
                     },
                 },
             )
