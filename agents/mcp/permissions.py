@@ -102,6 +102,11 @@ TOOL_POLICIES: dict[str, ToolPolicy] = {
     "freshdesk_get_ticket_summary": ToolPolicy(required_any={"support_access"}),
     "freshdesk_list_groups": ToolPolicy(required_any={"support_access"}),
     "freshdesk_get_contact": ToolPolicy(required_any={"support_access"}),
+    # Inspects customer-facing text against the tenant reply policy and returns
+    # the verdict. write=False: it sends nothing and changes nothing, so a
+    # read_only caller may ask whether text would be allowed -- being told
+    # "no" is exactly what read_only should still be able to learn.
+    "freshdesk_validate_reply_body": ToolPolicy(required_any={"support_access"}),
     # Freshdesk writes. Every one mutates a live ticket — a reply and a public
     # note reach the customer — so all are write=True and refused to a
     # read_only caller before the reply guardrail is ever consulted.

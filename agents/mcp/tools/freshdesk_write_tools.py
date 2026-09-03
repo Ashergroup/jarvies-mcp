@@ -1,8 +1,13 @@
 """Freshdesk MCP write tools — guardrailed, audited ticket mutations.
 
-Companion to ``freshdesk_tools.py`` (read-only). Five tools, each mutating one
-live ticket: ``freshdesk_reply_to_ticket``, ``freshdesk_add_note``,
+Companion to ``freshdesk_tools.py`` (read-only). Five tools mutate one live
+ticket: ``freshdesk_reply_to_ticket``, ``freshdesk_add_note``,
 ``freshdesk_update_ticket``, ``freshdesk_assign_ticket``, ``freshdesk_escalate``.
+A sixth, ``freshdesk_validate_reply_body``, writes nothing: it exposes the
+reply guardrail's verdict on its own, so a caller whose send does NOT come
+back through this server can still be held to the tenant's policy. It lives
+here rather than in the read module because it reuses this module's guardrail
+directly -- one implementation, not a copy.
 Auth, base URL, credential resolution, and the response envelope are reused from
 the read module unchanged.
 
@@ -67,7 +72,7 @@ import httpx
 
 from agents.mcp.credentials import resolve_settings
 from agents.mcp.database import get_conn
-from agents.mcp.integrations import IntegrationResult, not_configured
+from agents.mcp.integrations import IntegrationResult, not_configured, ok
 from agents.mcp.permissions import check_permission
 from agents.mcp.tenant import current_tenant
 from agents.mcp.tenant_context import use_tenant_context
@@ -636,6 +641,92 @@ async def _invoke(
 # ---------------------------------------------------------------------------
 
 
+async def freshdesk_validate_reply_body(
+    body: str,
+    tenant_id: str | None = None,
+    user_id: str | None = None,
+    access_token: str | None = None,
+    permissions: list[str] | None = None,
+) -> dict[str, Any]:
+    """Check customer-facing text against this tenant's reply policy, without sending.
+
+    The read-only half of the reply guardrail. ``freshdesk_reply_to_ticket``
+    runs this same check inline and refuses the send when a rule fires; this
+    tool returns the verdict on its own and sends nothing.
+
+    It exists because the guardrail is only a guardrail on paths that pass
+    through it. A reply delivered some other way -- by a Freshdesk automation,
+    or on a messaging channel this server does not send to -- never reaches
+    ``freshdesk_reply_to_ticket``, so its check never runs. A caller on such a
+    path calls this first and refuses to proceed when ``allowed`` is false.
+    That keeps one implementation and one tenant policy behind every
+    customer-facing path, instead of a second copy drifting inside a caller.
+
+    Nothing is written and no audit row is recorded: there is no mutation to
+    account for. The policy is resolved live for the calling tenant, so a
+    policy change takes effect here at the same moment it takes effect on the
+    reply path -- which is the whole point of asking the server rather than
+    hardcoding the rules somewhere else.
+
+    Args:
+        body: The customer-facing text to inspect, checked exactly as
+            ``freshdesk_reply_to_ticket`` would check it.
+
+    Returns:
+        IntegrationResult dict. ``data.allowed`` is the verdict. When it is
+        false, ``data.rule`` names the single rule that fired, ``data.detail``
+        says what it objected to, and ``data.match`` quotes the offending
+        fragment with a little surrounding context. ``data.policy_from_db`` is
+        true when this tenant has a stored policy row and false when the
+        restrictive defaults applied, so a caller logging it can tell "no rule
+        fired" apart from "no policy is configured". ``data.checked_chars`` is
+        the length inspected, for confirming the whole draft was seen.
+    """
+
+    context = _context(tenant_id, user_id, access_token, permissions)
+    with use_tenant_context(context):
+        check_permission(
+            context.tenant_id,
+            context.user_id,
+            "freshdesk_validate_reply_body",
+            context.permissions,
+        )
+
+        text = (body or "").strip()
+        if not text:
+            # Same refusal the write tools give. Answering "allowed" for an
+            # empty body would be read as a green light by a caller about to
+            # send something it built wrong.
+            return _error("body cannot be empty")
+
+        resolved = await resolve_freshdesk_reply_policy()
+        verdict = evaluate_reply_body(text, resolved.policy)
+
+        # The rule, never the text: this runs on customer-facing drafts.
+        log.info(
+            "freshdesk_reply_body_validated",
+            extra={
+                "allowed": verdict.allowed,
+                "rule": verdict.rule,
+                "policy_from_db": resolved.from_db,
+                "tenant_id": context.tenant_id,
+                "checked_chars": len(text),
+            },
+        )
+
+        return ok(
+            "freshdesk",
+            {
+                "allowed": verdict.allowed,
+                "rule": verdict.rule,
+                "detail": verdict.detail,
+                "match": verdict.match,
+                "policy_from_db": resolved.from_db,
+                "checked_chars": len(text),
+            },
+        )
+
+
 async def freshdesk_reply_to_ticket(
     ticket_id: str | int,
     body: str,
@@ -1130,6 +1221,7 @@ async def freshdesk_escalate(
 def register(mcp: Any) -> None:
     """Register Freshdesk MCP write tools."""
 
+    mcp.tool()(freshdesk_validate_reply_body)
     mcp.tool()(freshdesk_reply_to_ticket)
     mcp.tool()(freshdesk_add_note)
     mcp.tool()(freshdesk_update_ticket)
