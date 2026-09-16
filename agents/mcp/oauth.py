@@ -22,7 +22,6 @@ or PKCE verifiers are ever logged.
 from __future__ import annotations
 
 import base64
-import functools
 import hashlib
 import logging
 import secrets
@@ -31,7 +30,7 @@ from datetime import UTC, datetime, timedelta
 from typing import Any
 from urllib.parse import urlencode
 
-import anyio
+import httpx
 from jose import JWTError
 from jose import jwt as jose_jwt
 from starlette.requests import Request
@@ -419,32 +418,35 @@ async def auth_callback(request: Request) -> Response:
 
 
 async def _exchange_ms_code(code: str, ms_code_verifier: str) -> dict[str, Any]:
-    """Exchange a Microsoft auth code for tokens via MSAL (run off the loop)."""
+    """Exchange a Microsoft auth code and retain the refresh token.
 
-    import msal
-
+    MSAL deliberately hides the refresh token from its result, which caused
+    the callback to persist NULL and made silent refresh impossible. The v2
+    token endpoint returns the complete token response.
+    """
     settings = get_settings()
-
-    def _do() -> dict[str, Any]:
-        client = msal.ConfidentialClientApplication(
-            client_id=settings.azure_client_id,
-            client_credential=settings.azure_client_secret,
-            authority=settings.azure_authority,
-        )
-        # Pass code_verifier via the `data` dict, not as a keyword argument.
-        # MSAL merges `data` into the token-exchange POST body sent to Microsoft
-        # (which is where PKCE needs it). Passing code_verifier= directly forwards
-        # it through **kwargs down to the HTTP layer, raising
-        # "Session.request() got an unexpected keyword argument 'code_verifier'".
-        # The `data` form is also stable across MSAL versions.
-        return client.acquire_token_by_authorization_code(
-            code,
-            scopes=MSAL_SCOPES,
-            redirect_uri=settings.azure_redirect_uri,
-            data={"code_verifier": ms_code_verifier},
-        )
-
-    return await anyio.to_thread.run_sync(functools.partial(_do))
+    token_url = f"{settings.azure_authority.rstrip('/')}/oauth2/v2.0/token"
+    form = {
+        "client_id": settings.azure_client_id,
+        "client_secret": settings.azure_client_secret,
+        "grant_type": "authorization_code",
+        "code": code,
+        "redirect_uri": settings.azure_redirect_uri,
+        "code_verifier": ms_code_verifier,
+        "scope": MS_REDIRECT_SCOPE,
+    }
+    async with httpx.AsyncClient(timeout=settings.integration_http_timeout_seconds) as client:
+        response = await client.post(token_url, data=form)
+    result = response.json()
+    if response.is_error:
+        return result
+    id_token = result.get("id_token")
+    if id_token:
+        try:
+            result["id_token_claims"] = jose_jwt.get_unverified_claims(id_token)
+        except JWTError:
+            result["id_token_claims"] = {}
+    return result
 
 
 async def _persist_identity(

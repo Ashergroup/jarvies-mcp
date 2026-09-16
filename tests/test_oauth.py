@@ -161,35 +161,31 @@ def test_authorize_requires_pkce() -> None:
 # ---------------------------------------------------------------------------
 
 
-def test_exchange_ms_code_passes_code_verifier_in_data(monkeypatch: pytest.MonkeyPatch) -> None:
-    """code_verifier must go inside the `data` dict, never as a bare kwarg.
-
-    Regression: a bare code_verifier= is forwarded through MSAL's **kwargs to
-    Session.request() and raises TypeError in the container's MSAL.
-    """
-
+def test_exchange_ms_code_persists_refresh_token_and_pkce() -> None:
+    """The direct token exchange retains Microsoft's refresh-token seed."""
     import anyio
+    import httpx
+    import respx
 
-    captured: dict[str, object] = {}
-
-    class FakeClient:
-        def __init__(self, *args, **kwargs) -> None:
-            pass
-
-        def acquire_token_by_authorization_code(self, code, **kwargs):
-            captured["code"] = code
-            captured["kwargs"] = kwargs
-            return {"access_token": "ms-access", "id_token_claims": {}}
-
-    import msal
-
-    monkeypatch.setattr(msal, "ConfidentialClientApplication", FakeClient)
-
-    result = anyio.run(oauth._exchange_ms_code, "ms-auth-code", "the-verifier")
+    settings = oauth.get_settings()
+    token_url = f"{settings.azure_authority.rstrip('/')}/oauth2/v2.0/token"
+    with respx.mock(assert_all_called=True) as mock:
+        route = mock.post(token_url).mock(
+            return_value=httpx.Response(
+                200,
+                json={
+                    "access_token": "ms-access",
+                    "refresh_token": "ms-refresh",
+                    "expires_in": 3600,
+                    "id_token": "not-a-jwt",
+                },
+            )
+        )
+        result = anyio.run(oauth._exchange_ms_code, "ms-auth-code", "the-verifier")
 
     assert result["access_token"] == "ms-access"
-    assert "code_verifier" not in captured["kwargs"], "must not be a bare kwarg"
-    assert captured["kwargs"]["data"] == {"code_verifier": "the-verifier"}
+    assert result["refresh_token"] == "ms-refresh"
+    assert "code_verifier=the-verifier" in route.calls[0].request.content.decode()
 
 
 def test_callback_invalid_state_returns_404() -> None:
