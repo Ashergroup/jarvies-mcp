@@ -16,6 +16,7 @@ from starlette.responses import JSONResponse, Response
 from agents.mcp.admin_consent import CONSENT_PUBLIC_PATHS
 from agents.mcp.config import get_settings
 from agents.mcp.oauth import OAUTH_PUBLIC_PATHS, decode_jarvies_token
+from agents.mcp.xero_oauth import XERO_OAUTH_PUBLIC_PATHS
 
 try:  # PyJWT is optional until JWT auth is enabled.
     import jwt
@@ -28,7 +29,9 @@ log = logging.getLogger(__name__)
 # Note: "/" is intentionally NOT public. The MCP Streamable HTTP endpoint is
 # served at the root (claude.ai POSTs there), so an unauthenticated request must
 # get a 401 with a WWW-Authenticate challenge to start the OAuth flow.
-PUBLIC_PATHS = {"/health"} | OAUTH_PUBLIC_PATHS | CONSENT_PUBLIC_PATHS
+PUBLIC_PATHS = (
+    {"/health"} | OAUTH_PUBLIC_PATHS | CONSENT_PUBLIC_PATHS | XERO_OAUTH_PUBLIC_PATHS
+)
 
 # The portal (/portal/*) enforces its own signed-cookie sessions, so the MCP
 # bearer/JWT auth layer must not gate it — same treatment as /admin/*.

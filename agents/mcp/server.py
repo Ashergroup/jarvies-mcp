@@ -23,6 +23,7 @@ from agents.mcp.portal_schema import ensure_portal_schema
 from agents.mcp.proxy import ForwardedProtoMiddleware
 from agents.mcp.tenant import TenantResolutionMiddleware
 from agents.mcp.tool_registry import register_all_tools
+from agents.mcp.xero_oauth import register_xero_oauth_routes
 from portal.app import build_portal_routes
 
 
@@ -166,6 +167,11 @@ register_admin_routes(app)
 # MCPAuthMiddleware (see auth.CONSENT_PUBLIC_PATHS); /auth/callback is already
 # registered by register_oauth_routes and stays public.
 register_consent_routes(app)
+
+# Hosted Xero OAuth (/oauth/xero/start, /oauth/xero/callback). Both paths are
+# exempt from MCPAuthMiddleware via auth.PUBLIC_PATHS (exact set, not a prefix);
+# trust comes from the single-use `state` row, not from the path being public.
+register_xero_oauth_routes(app)
 
 # Portal UI (/portal/*, sales portal today). Exempt from MCPAuthMiddleware via
 # auth.PORTAL_PATH_PREFIX; enforces its own signed-cookie sessions.

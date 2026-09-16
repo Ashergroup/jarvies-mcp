@@ -195,8 +195,52 @@ async def persist_xero_refresh_token(tenant_id: str, new_refresh_token: str) -> 
         )
 
 
+_UPSERT_CREDENTIAL_SQL = """
+    INSERT INTO tenant_credentials
+        (tenant_id, credential_type, credential_ciphertext, key_version,
+         credential_key, metadata)
+    VALUES ($1, $2, $3, $4, NULL, $5::jsonb)
+    ON CONFLICT (tenant_id, credential_type)
+    DO UPDATE SET
+        credential_ciphertext = EXCLUDED.credential_ciphertext,
+        key_version = EXCLUDED.key_version,
+        credential_key = NULL,
+        metadata = EXCLUDED.metadata,
+        updated_at = now()
+"""
+
+
+async def _write_credential_rows(
+    conn: Any, tenant_id: str, rows: dict[str, dict[str, Any]]
+) -> None:
+    """Encrypt and write each credential row on an existing connection.
+
+    Assumes the caller has opened a transaction. ``metadata`` is written exactly
+    as given — the ``ON CONFLICT`` clause REPLACES the JSONB wholesale, so callers
+    doing a partial update must merge onto the existing document first.
+    """
+
+    for credential_type, payload in rows.items():
+        secret = payload.get("credential_key")
+        if secret:
+            ciphertext, key_version = get_cipher().encrypt(secret)
+        else:
+            ciphertext, key_version = None, None
+        await conn.execute(
+            _UPSERT_CREDENTIAL_SQL,
+            uuid.UUID(tenant_id),
+            credential_type,
+            ciphertext,
+            key_version,
+            json.dumps(payload.get("metadata") or {}),
+        )
+
+
 async def upsert_tenant_credentials(
-    tenant_id: str, rows: dict[str, dict[str, Any]]
+    tenant_id: str,
+    rows: dict[str, dict[str, Any]],
+    *,
+    conn: Any | None = None,
 ) -> None:
     """Encrypt each row's primary secret and upsert. Never stores plaintext.
 
@@ -207,32 +251,19 @@ async def upsert_tenant_credentials(
     is stored ``NULL``. ``metadata`` is written unchanged. All rows go in one
     transaction. Raises ``CryptoNotConfiguredError`` when a secret needs
     encrypting but no key is configured — the caller must not store plaintext.
+
+    ``conn`` lets a caller enlist this write in a transaction it already owns, so
+    a credential write can be made atomic with other statements (the hosted Xero
+    OAuth callback writes credentials and the org inventory together). When
+    ``conn`` is given, this function neither acquires a connection nor opens a
+    transaction — the caller's transaction governs commit and rollback. When it is
+    omitted the behaviour is unchanged: acquire a pooled connection and wrap the
+    writes in their own transaction.
     """
 
-    async with get_conn() as conn, conn.transaction():
-        for credential_type, payload in rows.items():
-            secret = payload.get("credential_key")
-            if secret:
-                ciphertext, key_version = get_cipher().encrypt(secret)
-            else:
-                ciphertext, key_version = None, None
-            await conn.execute(
-                """
-                INSERT INTO tenant_credentials
-                    (tenant_id, credential_type, credential_ciphertext, key_version,
-                     credential_key, metadata)
-                VALUES ($1, $2, $3, $4, NULL, $5::jsonb)
-                ON CONFLICT (tenant_id, credential_type)
-                DO UPDATE SET
-                    credential_ciphertext = EXCLUDED.credential_ciphertext,
-                    key_version = EXCLUDED.key_version,
-                    credential_key = NULL,
-                    metadata = EXCLUDED.metadata,
-                    updated_at = now()
-                """,
-                uuid.UUID(tenant_id),
-                credential_type,
-                ciphertext,
-                key_version,
-                json.dumps(payload.get("metadata") or {}),
-            )
+    if conn is not None:
+        await _write_credential_rows(conn, tenant_id, rows)
+        return
+
+    async with get_conn() as own_conn, own_conn.transaction():
+        await _write_credential_rows(own_conn, tenant_id, rows)

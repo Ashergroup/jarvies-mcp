@@ -76,6 +76,32 @@ PORTAL_DDL_STATEMENTS = [
     # because it holds no secret and is returned in full by the admin API; see
     # agents.mcp.tenant_policy for the resolution path.
     TENANT_POLICY_DDL,
+    # Hosted Xero OAuth (agents.mcp.xero_oauth).
+    #
+    # oauth_states.purpose scopes a state row to the flow that minted it, so the
+    # Microsoft admin-consent flow and the Xero flow cannot consume each other's
+    # states. The default matches the pre-existing rows, which are all Microsoft
+    # admin-consent. Safe here because ensure_consent_schema (which CREATEs
+    # oauth_states) runs before ensure_portal_schema at startup — see
+    # agents.mcp.server._lifespan.
+    "ALTER TABLE oauth_states ADD COLUMN IF NOT EXISTS purpose TEXT "
+    "DEFAULT 'ms_consent'",
+    # Xero organisations returned by /connections for a tenant. The live org's
+    # GUID is also mirrored into tenant_credentials.metadata->>'tenant_id', which
+    # is what XeroService sends as the Xero-tenant-id header; this table is the
+    # inventory of everything the tenant authorised.
+    """
+    CREATE TABLE IF NOT EXISTS xero_client_orgs (
+        tenant_id UUID NOT NULL REFERENCES tenants(id) ON DELETE CASCADE,
+        xero_tenant_id TEXT NOT NULL,
+        org_name TEXT,
+        active BOOLEAN DEFAULT true,
+        created_at TIMESTAMPTZ DEFAULT now(),
+        PRIMARY KEY (tenant_id, xero_tenant_id)
+    )
+    """,
+    "CREATE INDEX IF NOT EXISTS idx_xero_client_orgs_tenant "
+    "ON xero_client_orgs(tenant_id)",
 ]
 
 

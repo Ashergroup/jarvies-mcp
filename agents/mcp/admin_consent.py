@@ -45,6 +45,13 @@ MS_ADMIN_CONSENT_URL = "https://login.microsoftonline.com/common/adminconsent"
 
 STATE_TTL_MINUTES = 10
 
+# oauth_states.purpose value for this flow, and the column's default so rows
+# written before the column existed are treated as belonging here. Each OAuth
+# flow sharing oauth_states filters on its own purpose (see
+# agents.mcp.xero_oauth.STATE_PURPOSE) so one flow can never consume another's
+# state.
+STATE_PURPOSE = "ms_consent"
+
 # Schema for the admin-consent flow. Mirrors the DDL added to
 # scripts/migrate.py; applied idempotently at startup via ensure_consent_schema.
 CONSENT_DDL_STATEMENTS = [
@@ -113,12 +120,13 @@ async def _store_state(
     async with get_conn() as conn:
         await conn.execute(
             """
-            INSERT INTO oauth_states (state, tenant_hint, plan, expires_at)
-            VALUES ($1, $2, $3, $4)
+            INSERT INTO oauth_states (state, tenant_hint, plan, purpose, expires_at)
+            VALUES ($1, $2, $3, $4, $5)
             """,
             state,
             tenant_hint,
             plan,
+            STATE_PURPOSE,
             expires_at,
         )
 
@@ -128,16 +136,26 @@ async def _consume_state(state: str) -> dict[str, Any] | None:
 
     Returns the row dict when the state is known and unexpired, else None. Any
     matching row is deleted even when expired, so a state can never be reused.
+
+    Scoped to ``purpose = 'ms_consent'`` (this flow's value, and the column
+    default for every row written before ``purpose`` existed) so a state minted by
+    another flow — e.g. the hosted Xero OAuth flow in ``agents.mcp.xero_oauth`` —
+    is neither read nor deleted here, and stays available to its own callback.
     """
 
     async with get_conn() as conn, conn.transaction():
         row = await conn.fetchrow(
             "SELECT state, tenant_hint, plan, expires_at FROM oauth_states "
-            "WHERE state = $1",
+            "WHERE state = $1 AND purpose = $2",
             state,
+            STATE_PURPOSE,
         )
         if row is not None:
-            await conn.execute("DELETE FROM oauth_states WHERE state = $1", state)
+            await conn.execute(
+                "DELETE FROM oauth_states WHERE state = $1 AND purpose = $2",
+                state,
+                STATE_PURPOSE,
+            )
     if row is None:
         return None
     expires_at = row["expires_at"]

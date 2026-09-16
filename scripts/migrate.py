@@ -168,6 +168,28 @@ DDL_STATEMENTS = [
         UNIQUE(tenant_id, policy_type)
     )
     """,
+    # Hosted Xero OAuth (agents.mcp.xero_oauth). Mirrors the tail of
+    # agents.mcp.portal_schema.PORTAL_DDL_STATEMENTS, which applies the same two
+    # statements idempotently at server startup. Kept inline so this script stays
+    # standalone (no agents.* import).
+    #
+    # oauth_states.purpose scopes a state row to the flow that minted it so the
+    # Microsoft admin-consent flow and the Xero flow cannot consume each other's
+    # states. The default matches the pre-existing rows (all admin-consent).
+    "ALTER TABLE oauth_states ADD COLUMN IF NOT EXISTS purpose TEXT "
+    "DEFAULT 'ms_consent'",
+    """
+    CREATE TABLE IF NOT EXISTS xero_client_orgs (
+        tenant_id UUID NOT NULL REFERENCES tenants(id) ON DELETE CASCADE,
+        xero_tenant_id TEXT NOT NULL,
+        org_name TEXT,
+        active BOOLEAN DEFAULT true,
+        created_at TIMESTAMPTZ DEFAULT now(),
+        PRIMARY KEY (tenant_id, xero_tenant_id)
+    )
+    """,
+    "CREATE INDEX IF NOT EXISTS idx_xero_client_orgs_tenant "
+    "ON xero_client_orgs(tenant_id)",
 ]
 
 
