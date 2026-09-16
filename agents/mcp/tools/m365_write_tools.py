@@ -721,7 +721,7 @@ async def m365_send_email(
     access_token: str | None = None,
     permissions: list[str] | None = None,
 ) -> dict[str, Any]:
-    """Send an email via Microsoft Graph `POST /users/{upn}/sendMail`.
+    """Send an email via Microsoft Graph.
 
     Unlike `m365_create_email_draft`, this delivers the message immediately
     and saves a copy to Sent Items. Requires the delegated `Mail.Send` scope.
@@ -732,9 +732,8 @@ async def m365_send_email(
         body: Plain-text body.
         cc: Optional list of CC recipients.
         in_reply_to_uri: Optional `mail:///messages/{id}` URI of the message
-            this is a reply to. `sendMail` does not thread natively, so the
-            value is recorded on the sent message as the custom internet header
-            `x-in-reply-to-uri` for traceability.
+            this is a reply to. When supplied, Graph's native `reply` endpoint
+            is used so Outlook preserves the conversation thread.
 
     Returns:
         `{"status": "ok", "data": {"sent": True, "to", "subject"}}` or an
@@ -754,26 +753,42 @@ async def m365_send_email(
         if not isinstance(to, list) or not to:
             return _err("to must be a non-empty list of email addresses")
 
+        recipients = [{"emailAddress": {"address": a}} for a in to]
+        cc_recipients = (
+            [{"emailAddress": {"address": a}} for a in cc] if cc else []
+        )
         message: dict[str, Any] = {
-            "subject": subject,
-            "body": {"contentType": "Text", "content": body},
-            "toRecipients": [{"emailAddress": {"address": a}} for a in to],
+            "toRecipients": recipients,
         }
-        if cc:
-            message["ccRecipients"] = [{"emailAddress": {"address": a}} for a in cc]
-        if in_reply_to_uri:
-            message["internetMessageHeaders"] = [
-                {"name": "x-in-reply-to-uri", "value": in_reply_to_uri}
-            ]
-        payload = {"message": message, "saveToSentItems": True}
+        if cc_recipients:
+            message["ccRecipients"] = cc_recipients
 
         try:
             mbox = _mailbox_base(await _get_upn(context.user_id))
         except M365IdentityError as exc:
             return _err(str(exc))
 
+        if in_reply_to_uri:
+            prefix = "mail:///messages/"
+            if not in_reply_to_uri.startswith(prefix):
+                return _err(f"Not an email URI: {in_reply_to_uri}")
+            message_id = in_reply_to_uri.removeprefix(prefix)
+            if not message_id:
+                return _err(f"Not an email URI: {in_reply_to_uri}")
+            path = f"{mbox}/messages/{message_id}/reply"
+            payload = {"message": message, "comment": body}
+        else:
+            message.update(
+                {
+                    "subject": subject,
+                    "body": {"contentType": "Text", "content": body},
+                }
+            )
+            path = f"{mbox}/sendMail"
+            payload = {"message": message, "saveToSentItems": True}
+
         async def _attempt(tok: str) -> dict[str, Any]:
-            return await _graph_request("POST", f"{mbox}/sendMail", tok, json=payload)
+            return await _graph_request("POST", path, tok, json=payload)
 
         try:
             await _retry_on_401(context, token, _attempt)

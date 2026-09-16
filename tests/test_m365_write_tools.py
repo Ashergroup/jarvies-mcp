@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import logging
 from contextlib import contextmanager
 from datetime import UTC, datetime, timedelta
@@ -127,6 +128,32 @@ async def test_send_email_error_on_403(upn: str) -> None:
 
     assert result["status"] == "error"
     assert "403" in (result["error"] or "")
+
+
+@pytest.mark.asyncio
+async def test_send_email_reply_uses_native_graph_reply_endpoint(upn: str) -> None:
+    with respx.mock(assert_all_called=True) as mock:
+        route = mock.post(f"{GRAPH}{USERS}/messages/original-1/reply").mock(
+            return_value=httpx.Response(202)
+        )
+        result = await m365_write_tools.m365_send_email(
+            to=["a@nichegroup.africa"],
+            subject="Re: Hello",
+            body="Reply body",
+            cc=["b@nichegroup.africa"],
+            in_reply_to_uri="mail:///messages/original-1",
+            access_token=TOKEN,
+            permissions=PERMS,
+        )
+
+    assert result["status"] == "ok"
+    assert route.calls[0].request.url.path.endswith("/messages/original-1/reply")
+    payload = json.loads(route.calls[0].request.content)
+    assert payload["comment"] == "Reply body"
+    assert payload["message"]["toRecipients"][0]["emailAddress"]["address"] == (
+        "a@nichegroup.africa"
+    )
+    assert "internetMessageHeaders" not in payload["message"]
 
 
 # ---------------------------------------------------------------------------
