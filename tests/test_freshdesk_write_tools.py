@@ -33,8 +33,24 @@ REPLY_URL = f"{BASE}/tickets/{TICKET_ID}/reply"
 NOTES_URL = f"{BASE}/tickets/{TICKET_ID}/notes"
 TICKET_URL = f"{BASE}/tickets/{TICKET_ID}"
 
+# The guardrailed ticket mutations: one ticket per call, a caller-supplied
+# reason on every call. The cross-cutting contract tests below are parametrized
+# over this tuple.
 WRITE_TOOLS = (
     "freshdesk_reply_to_ticket",
+    "freshdesk_add_note",
+    "freshdesk_update_ticket",
+    "freshdesk_assign_ticket",
+    "freshdesk_escalate",
+)
+
+# Everything register() installs, in registration order. stage_ai_reply is a
+# write tool and needs the same permission policy, but it is not in WRITE_TOOLS:
+# it takes no `reason` (it writes custom fields for an automation, with a fixed
+# reason on its own audit row) so the reason contract does not apply to it.
+REGISTERED_TOOLS = (
+    "freshdesk_reply_to_ticket",
+    "stage_ai_reply",
     "freshdesk_add_note",
     "freshdesk_update_ticket",
     "freshdesk_assign_ticket",
@@ -124,18 +140,18 @@ def stored_policy(monkeypatch: pytest.MonkeyPatch):
 # ---------------------------------------------------------------------------
 
 
-@pytest.mark.parametrize("tool", WRITE_TOOLS)
+@pytest.mark.parametrize("tool", REGISTERED_TOOLS)
 def test_write_tools_require_support_access(tool: str) -> None:
     assert check_permission("tenant-a", "user-a", tool, ["support_access"])
 
 
-@pytest.mark.parametrize("tool", WRITE_TOOLS)
+@pytest.mark.parametrize("tool", REGISTERED_TOOLS)
 def test_write_tools_denied_without_support_access(tool: str) -> None:
     with pytest.raises(MCPPermissionError, match="requires one of: support_access"):
         check_permission("tenant-a", "user-a", tool, ["freshsales_access"])
 
 
-@pytest.mark.parametrize("tool", WRITE_TOOLS)
+@pytest.mark.parametrize("tool", REGISTERED_TOOLS)
 def test_write_tools_are_refused_to_read_only_callers(tool: str) -> None:
     assert TOOL_POLICIES[tool].write is True
     with pytest.raises(MCPPermissionError, match="read_only"):
@@ -154,7 +170,7 @@ def test_all_write_tools_are_registered() -> None:
             return decorate
 
     freshdesk_write_tools.register(_Recorder())
-    assert registered == list(WRITE_TOOLS)
+    assert registered == list(REGISTERED_TOOLS)
 
 
 def test_module_carries_no_client_specific_values() -> None:
@@ -819,6 +835,125 @@ async def test_update_ticket_with_no_fields_is_refused(
 
     assert result["status"] == "error"
     assert "nothing to update" in result["error"]
+
+
+@pytest.mark.asyncio
+async def test_stage_ai_reply_writes_only_whatsapp_fields(
+    as_tenant, audit_rows, stored_policy
+) -> None:
+    as_tenant()
+    stored_policy(None)
+    with respx.mock:
+        respx.get(TICKET_URL).mock(
+            return_value=httpx.Response(
+                200, json={"id": TICKET_ID, "source": 13, "custom_fields": {}}
+            )
+        )
+        route = respx.put(TICKET_URL).mock(
+            return_value=httpx.Response(200, json={"id": TICKET_ID})
+        )
+        result = await freshdesk_write_tools.stage_ai_reply(
+            ticket_id=TICKET_ID,
+            reply_body="We have checked this for you.",
+            permissions=["support_access"],
+        )
+
+    assert result["status"] == "ok"
+    payload = json.loads(route.calls[0].request.content)
+    assert payload == {
+        "custom_fields": {
+            "cf_ai_reply_body": "We have checked this for you.",
+            "cf_ai_reply_ready": True,
+            "cf_ai_reply_status": "staged",
+        }
+    }
+    assert audit_rows[0]["action"] == "stage_ai_reply"
+
+
+@pytest.mark.asyncio
+async def test_stage_ai_reply_duplicate_is_idempotent(
+    as_tenant, audit_rows, stored_policy
+) -> None:
+    as_tenant()
+    stored_policy(None)
+    body = "Already staged."
+    with respx.mock:
+        respx.get(TICKET_URL).mock(
+            return_value=httpx.Response(
+                200,
+                json={
+                    "id": TICKET_ID,
+                    "source": 13,
+                    "custom_fields": {
+                        "cf_ai_reply_body": body,
+                        "cf_ai_reply_status": "staged",
+                    },
+                },
+            )
+        )
+        route = respx.put(TICKET_URL)
+        result = await freshdesk_write_tools.stage_ai_reply(
+            ticket_id=TICKET_ID,
+            reply_body=body,
+            permissions=["support_access"],
+        )
+
+    assert result["status"] == "ok"
+    assert result["data"]["idempotent"] is True
+    assert route.call_count == 0
+
+
+@pytest.mark.asyncio
+async def test_stage_ai_reply_refuses_non_whatsapp_ticket(
+    as_tenant, stored_policy
+) -> None:
+    as_tenant()
+    stored_policy(None)
+    with respx.mock:
+        respx.get(TICKET_URL).mock(
+            return_value=httpx.Response(
+                200, json={"id": TICKET_ID, "source": 1, "custom_fields": {}}
+            )
+        )
+        route = respx.put(TICKET_URL)
+        result = await freshdesk_write_tools.stage_ai_reply(
+            ticket_id=TICKET_ID,
+            reply_body="This must not be staged.",
+            permissions=["support_access"],
+        )
+
+    assert result["status"] == "error"
+    assert "not a WhatsApp ticket" in result["error"]
+    assert route.call_count == 0
+
+
+@pytest.mark.asyncio
+async def test_stage_ai_reply_is_blocked_by_reply_policy(
+    as_tenant, stored_policy
+) -> None:
+    """Staged text reaches the customer, so it faces the reply guardrail.
+
+    The refusal lands before any Freshdesk call: the ticket is never read and
+    the custom fields are never written.
+    """
+
+    as_tenant()
+    stored_policy(None)
+    with respx.mock:
+        get_route = respx.get(TICKET_URL)
+        put_route = respx.put(TICKET_URL)
+        result = await freshdesk_write_tools.stage_ai_reply(
+            ticket_id=TICKET_ID,
+            reply_body="Your refund of R1 250.00 has been approved.",
+            permissions=["support_access"],
+        )
+
+    assert result["status"] == "error"
+    assert result["data"]["blocked"] is True
+    assert result["data"]["rule"] == "reply_block_prices"
+    assert result["error"].startswith("Not staged")
+    assert get_route.call_count == 0
+    assert put_route.call_count == 0
 
 
 @pytest.mark.asyncio

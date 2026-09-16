@@ -108,6 +108,7 @@ TOOL_POLICIES: dict[str, ToolPolicy] = {
     "freshdesk_reply_to_ticket": ToolPolicy(
         required_any={"support_access"}, write=True
     ),
+    "stage_ai_reply": ToolPolicy(required_any={"support_access"}, write=True),
     "freshdesk_add_note": ToolPolicy(required_any={"support_access"}, write=True),
     "freshdesk_update_ticket": ToolPolicy(required_any={"support_access"}, write=True),
     "freshdesk_assign_ticket": ToolPolicy(required_any={"support_access"}, write=True),
