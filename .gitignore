@@ -58,3 +58,11 @@ initd.json
 td35.json
 make_td35.py
 migrate_diff.txt
+
+# Generated AWS CLI artifacts. Task-definition dumps and service/register
+# responses carry every env var IN PLAINTEXT, including credentials.
+# Four such files sat untracked here on 2026-09-18 with 12 plaintext secrets
+# each, one `git add .` away from entering history. Never commit these.
+*taskdef*.json
+*-taskdef.json
+*-output.json
